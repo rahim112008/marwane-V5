@@ -1,11 +1,9 @@
 """
-Bovine SNP Platform v5.0 - Etape 1
-Chargement donnees + QC
+Bovine SNP Platform v5.0 - Etape 2
+Chargement donnees + QC + LD Pruning + Structure (PCA/MDS)
 """
 import gzip
-import zipfile
 from collections import Counter
-from io import BytesIO
 
 import numpy as np
 import pandas as pd
@@ -14,6 +12,8 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 from scipy import stats
+from sklearn.decomposition import PCA
+from sklearn.manifold import MDS as SklearnMDS
 
 st.set_page_config(
     page_title="Bovine SNP Platform v5.0",
@@ -49,9 +49,7 @@ def _hash_ndarray(x):
             str(float(np.nansum(x))))
 
 
-HASH_FUNCS = {
-    np.ndarray: _hash_ndarray,
-}
+HASH_FUNCS = {np.ndarray: _hash_ndarray}
 
 
 def cache_data(func=None, **kw):
@@ -292,6 +290,17 @@ def generate_demo_data(n_ind=150, n_snp=800, n_pop=4, seed=42):
     return gt, ind_df, snp_df
 
 
+def impute_mean(gt):
+    gt2 = gt.astype(np.float32, copy=True)
+    col_mean = np.nanmean(gt2, axis=0)
+    col_mean = np.where(np.isnan(col_mean), 0.0, col_mean)
+    nan_mask = np.isnan(gt2)
+    if not nan_mask.any():
+        return gt2
+    gt2[nan_mask] = np.take(col_mean, np.where(nan_mask)[1])
+    return gt2
+
+
 def missingness_per_ind(gt):
     return np.isnan(gt).mean(axis=1)
 
@@ -467,6 +476,77 @@ def apply_qc_filters(gt, ind_df, snp_df, params):
     }
 
 
+@cache_data
+def ld_pruning(gt, window=50, step=5, r2_thr=0.2):
+    n_snp = gt.shape[1]
+    if n_snp < 3:
+        return np.ones(n_snp, dtype=bool)
+
+    keep = np.ones(n_snp, dtype=bool)
+    X = impute_mean(gt)
+    X = X - X.mean(axis=0)
+
+    i = 0
+    while i < n_snp:
+        win_end = min(i + step, n_snp)
+        while win_end < n_snp and (win_end - i) < window:
+            j = win_end
+            if keep[j] and keep[i]:
+                a, b = X[:, i], X[:, j]
+                if a.std() > 1e-8 and b.std() > 1e-8:
+                    r = np.corrcoef(a, b)[0, 1]
+                    if r * r > r2_thr:
+                        keep[j] = False
+            win_end += 1
+        i += step
+    return keep
+
+
+@cache_data
+def ld_decay(gt, snp_bp, max_kb=1000, max_snp=1500, seed=42):
+    n_snp = gt.shape[1]
+    if n_snp < 2:
+        return pd.DataFrame(columns=["dist_kb", "r2"])
+    rng = np.random.default_rng(seed)
+    idx = (np.sort(rng.choice(n_snp, max_snp, replace=False))
+           if n_snp > max_snp else np.arange(n_snp))
+    gt_sub = impute_mean(gt[:, idx])
+    bp_sub = np.asarray(snp_bp)[idx].astype(np.float64)
+    X = gt_sub - gt_sub.mean(0)
+    std = gt_sub.std(0)
+    std[std < 1e-8] = np.nan
+    X = X / std
+    C = (X.T @ X) / X.shape[0]
+    R2 = C ** 2
+    iu, ju = np.triu_indices(len(idx), k=1)
+    dist_kb = (bp_sub[ju] - bp_sub[iu]) / 1000.0
+    mask = (dist_kb > 0) & (dist_kb <= max_kb)
+    return pd.DataFrame({"dist_kb": dist_kb[mask],
+                         "r2": R2[iu[mask], ju[mask]]})
+
+
+@cache_data
+def pca_analysis(gt, n_components=10):
+    X = impute_mean(gt)
+    X = X - X.mean(axis=0)
+    n_comp = min(n_components, X.shape[0] - 1, X.shape[1])
+    pca = PCA(n_components=n_comp)
+    return pca.fit_transform(X), pca.explained_variance_ratio_ * 100.0
+
+
+@cache_data
+def mds_analysis(gt, n_components=5):
+    X = impute_mean(gt)
+    n = X.shape[0]
+    D = np.zeros((n, n), dtype=np.float32)
+    for i in range(n):
+        D[i] = np.abs(X - X[i]).sum(1) / X.shape[1]
+    return SklearnMDS(n_components=n_components,
+                      dissimilarity="precomputed",
+                      random_state=42, n_init=1, max_iter=300,
+                      normalized_stress=False).fit_transform(D)
+
+
 def plot_hist(values, title, xlabel, color="#3498db"):
     fig = go.Figure()
     fig.add_trace(go.Histogram(x=values, nbinsx=80, marker_color=color))
@@ -489,6 +569,42 @@ def plot_missingness_dashboard(miss_ind, miss_snp):
     fig.update_xaxes(title_text="Frequence manquante", row=1, col=1)
     fig.update_xaxes(title_text="Frequence manquante", row=1, col=2)
     fig.update_yaxes(title_text="Nombre", row=1, col=1)
+    return fig
+
+
+def plot_ld_decay(ld_df, bin_kb=20):
+    if ld_df is None or ld_df.empty:
+        return None
+    d = ld_df.copy()
+    d["bin"] = (d["dist_kb"] // bin_kb) * bin_kb
+    agg = d.groupby("bin")["r2"].mean().reset_index()
+    fig = px.line(agg, x="bin", y="r2",
+                  labels={"bin": "Distance (kb)", "r2": "r2 moyen"},
+                  title="LD decay", height=450)
+    fig.update_traces(line=dict(color="royalblue", width=3))
+    return fig
+
+
+def plot_pca(scores, var_pct, labels):
+    df = pd.DataFrame({"PC1": scores[:, 0], "PC2": scores[:, 1],
+                       "Population": labels})
+    fig = px.scatter(df, x="PC1", y="PC2", color="Population",
+                     title=("PCA - PC1 (" + str(round(var_pct[0], 1)) +
+                            " pct) vs PC2 (" +
+                            str(round(var_pct[1], 1)) + " pct)"),
+                     height=550)
+    fig.update_traces(marker=dict(size=10,
+                                  line=dict(width=1, color="white")))
+    return fig
+
+
+def plot_mds(coords, labels):
+    df = pd.DataFrame({"MDS1": coords[:, 0], "MDS2": coords[:, 1],
+                       "Population": labels})
+    fig = px.scatter(df, x="MDS1", y="MDS2", color="Population",
+                     title="MDS (IBS) - Structure", height=550)
+    fig.update_traces(marker=dict(size=10,
+                                  line=dict(width=1, color="white")))
     return fig
 
 
@@ -529,7 +645,9 @@ def interpret_maf(maf_values):
 
 
 _STATE_KEYS = ["gt", "ind_df", "snp_df",
-               "gt_filt", "ind_filt", "snp_filt", "qc_stats"]
+               "gt_filt", "ind_filt", "snp_filt", "qc_stats",
+               "gt_pruned", "snp_pruned", "ld_df",
+               "pca_scores", "pca_var", "mds_coords"]
 
 
 def init_state():
@@ -544,13 +662,24 @@ def has_data():
 
 def has_qc():
     return (st.session_state.gt_filt is not None
-            and st.session_state.qc_stats is not None)
+            and st.session_state.qc_stats is not None
+            and st.session_state.ind_filt is not None
+            and st.session_state.snp_filt is not None)
+
+
+def has_pruned():
+    return (st.session_state.gt_pruned is not None
+            and st.session_state.snp_pruned is not None)
+
+
+def _fid_array():
+    return st.session_state.ind_filt["FID"].astype(str).to_numpy()
 
 
 def main():
     init_state()
     st.title("Bovine SNP Platform v5.0")
-    st.caption("Etape 1 : Chargement donnees + QC")
+    st.caption("Etape 2 : QC + LD Pruning + Structure (PCA/MDS)")
 
     with st.sidebar:
         st.header("Donnees")
@@ -578,6 +707,10 @@ def main():
                     st.session_state.ind_filt = None
                     st.session_state.snp_filt = None
                     st.session_state.qc_stats = None
+                    st.session_state.gt_pruned = None
+                    st.session_state.snp_pruned = None
+                    st.session_state.pca_scores = None
+                    st.session_state.mds_coords = None
                 st.success(str(gt.shape[0]) + " ind x " +
                            str(gt.shape[1]) + " SNPs")
 
@@ -609,6 +742,10 @@ def main():
                         st.session_state.ind_filt = None
                         st.session_state.snp_filt = None
                         st.session_state.qc_stats = None
+                        st.session_state.gt_pruned = None
+                        st.session_state.snp_pruned = None
+                        st.session_state.pca_scores = None
+                        st.session_state.mds_coords = None
                         st.success(str(gt.shape[0]) + " ind x " +
                                    str(gt.shape[1]) + " SNPs")
                     except Exception as e:
@@ -628,6 +765,10 @@ def main():
         het_sd = st.slider("Heterozygotie sigma intra-race", 1.0, 5.0,
                            DEFAULT_THRESHOLDS["het_sd"], 0.1,
                            key="sb_het_sd")
+        st.divider()
+        ld_r2 = st.slider("LD Pruning r2 seuil", 0.05, 0.5,
+                          DEFAULT_THRESHOLDS["ld_r2"], 0.05,
+                          key="sb_ld_r2")
 
     if not has_data():
         st.info("Generez un jeu de demo ou importez PED/MAP.")
@@ -637,7 +778,7 @@ def main():
     ind_df = st.session_state.ind_df
     snp_df = st.session_state.snp_df
 
-    tabs = st.tabs(["Apercu", "QC"])
+    tabs = st.tabs(["Apercu", "QC", "LD Pruning", "Structure"])
 
     with tabs[0]:
         step_header("0", "Apercu des donnees",
@@ -684,6 +825,10 @@ def main():
                     st.session_state.ind_filt = ind_f
                     st.session_state.snp_filt = snp_f
                     st.session_state.qc_stats = qc_stats
+                    st.session_state.gt_pruned = None
+                    st.session_state.snp_pruned = None
+                    st.session_state.pca_scores = None
+                    st.session_state.mds_coords = None
                 st.success("QC termine.")
             except Exception as e:
                 st.error("Erreur : " + str(e))
@@ -736,6 +881,99 @@ def main():
                        str(maf_interp["explanation"]))
             st.json(maf_interp["metrics"])
             st.info(maf_interp["recommendation"])
+
+    with tabs[2]:
+        st.subheader("LD Pruning")
+        step_header("4.5", "Elagage par desequilibre de liaison",
+                    "Retire les SNPs correles (r2 > seuil) dans fenetre de "
+                    "50 SNPs.",
+                    "PCA et ADMIXTURE supposent marqueurs independants.",
+                    "Sous-ensemble quasi-independant.")
+
+        if not has_qc():
+            st.warning("Lancez d'abord le QC.")
+        else:
+            if st.button("Lancer le LD Pruning", type="primary",
+                         key="ld_btn_run"):
+                try:
+                    with st.spinner("LD pruning..."):
+                        keep = ld_pruning(st.session_state.gt_filt,
+                                          window=50, step=5,
+                                          r2_thr=ld_r2)
+                        st.session_state.gt_pruned = (
+                            st.session_state.gt_filt[:, keep])
+                        st.session_state.snp_pruned = (
+                            st.session_state.snp_filt[keep]
+                            .reset_index(drop=True))
+                    st.success(str(st.session_state.gt_pruned.shape[1]) +
+                               " SNPs conserves.")
+                except Exception as e:
+                    st.error("Erreur : " + str(e))
+
+            if has_pruned():
+                c1, c2, c3 = st.columns(3)
+                c1.metric("SNPs avant",
+                          st.session_state.gt_filt.shape[1])
+                c2.metric("SNPs apres",
+                          st.session_state.gt_pruned.shape[1])
+                pct = (100 * (1 - st.session_state.gt_pruned.shape[1] /
+                              st.session_state.gt_filt.shape[1]))
+                c3.metric("Reduction", str(round(pct, 1)) + " pct")
+
+                with st.spinner("LD decay..."):
+                    ld_df = ld_decay(st.session_state.gt_pruned,
+                                     st.session_state.snp_pruned["BP"].values,
+                                     max_kb=1000, max_snp=1000)
+                    st.session_state.ld_df = ld_df
+                fig = plot_ld_decay(ld_df)
+                if fig:
+                    st.plotly_chart(fig, use_container_width=True,
+                                    key="ld_plot_decay")
+
+    with tabs[3]:
+        st.subheader("Structure des populations")
+        step_header("5.3-5.4", "PCA et MDS",
+                    "PCA et MDS sur les SNPs independants.",
+                    "Visualiser la structure genetique.",
+                    "Nuages 2D des individus.")
+
+        if not has_qc():
+            st.warning("Lancez d'abord le QC.")
+        else:
+            gt_use = (st.session_state.gt_pruned if has_pruned()
+                      else st.session_state.gt_filt)
+
+            if st.button("Lancer PCA + MDS", type="primary",
+                         key="struct_btn_run"):
+                try:
+                    with st.spinner("PCA..."):
+                        s_, v_ = pca_analysis(gt_use, 10)
+                        st.session_state.pca_scores = s_
+                        st.session_state.pca_var = v_
+                    with st.spinner("MDS..."):
+                        st.session_state.mds_coords = mds_analysis(gt_use, 5)
+                    st.success("Termine.")
+                except Exception as e:
+                    st.error("Erreur : " + str(e))
+
+            if st.session_state.pca_scores is not None:
+                labels = _fid_array()
+                st.plotly_chart(
+                    plot_pca(st.session_state.pca_scores,
+                             st.session_state.pca_var, labels),
+                    use_container_width=True, key="struct_plot_pca")
+
+                var_tab = pd.DataFrame({
+                    "PC": ["PC" + str(i + 1) for i in range(10)],
+                    "Variance_pct": np.round(
+                        st.session_state.pca_var[:10], 3)})
+                st.dataframe(var_tab, use_container_width=True)
+
+            if st.session_state.mds_coords is not None:
+                labels = _fid_array()
+                st.plotly_chart(
+                    plot_mds(st.session_state.mds_coords, labels),
+                    use_container_width=True, key="struct_plot_mds")
 
 
 if __name__ == "__main__":
