@@ -1871,28 +1871,33 @@ def interpret_roh(froh):
 
 def interpret_with_llm(context, api_key=None,
                        model="llama-3.3-70b-versatile"):
+    # Appel a l'API Groq pour une analyse LLM du contexte.
     api_key = api_key or os.environ.get("GROQ_API_KEY")
     if not api_key:
-        return "⚠️ Pas de clé API Groq."
+        return "Pas de cle API Groq - interpretation heuristique affichee."
     try:
-        prompt = f"""Tu es un généticien expert en bioinformatique bovine.
-Analyse ces résultats : (1) Synthèse, (2) Interprétation biologique,
-(3) Points d'alerte, (4) Recommandations. Français, ≤ 400 mots.
-
-{json.dumps(context, indent=2, default=str)[:6000]}"""
+        prompt = (
+            "Tu es un geneticien expert en bioinformatique bovine. "
+            "Analyse ces resultats : (1) Synthese, "
+            "(2) Interpretation biologique, "
+            "(3) Points d'alerte, (4) Recommandations. "
+            "Reponds en francais en 400 mots maximum.\n\n"
+            + json.dumps(context, indent=2, default=str)[:6000]
+        )
         r = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}",
+            headers={"Authorization": "Bearer " + api_key,
                      "Content-Type": "application/json"},
             json={"model": model, "messages": [
-                {"role": "system", "content": "Expert génétique bovine."},
+                {"role": "system",
+                 "content": "Expert en genetique bovine."},
                 {"role": "user", "content": prompt}],
                 "temperature": 0.3, "max_tokens": 1200},
             timeout=30)
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"]
     except Exception as e:
-        return f"⚠️ Erreur LLM : {e}"
+        return "Erreur LLM : " + str(e)
 
 
 def render_ai_panel(module, data, key_suffix=""):
