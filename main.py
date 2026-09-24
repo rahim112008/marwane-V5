@@ -1683,10 +1683,8 @@ def _pdf_simple_table_lines(df, max_rows=20, max_cols=8):
 
 
 def build_pdf_with_reportlab(project_name, qc_stats, sections):
-    """
-    Génère un PDF via reportlab (plus fiable que fpdf2).
-    Si reportlab n'est pas dispo, on lève une exception claire.
-    """
+    # Genere un PDF via reportlab (plus fiable que fpdf2).
+    # Si reportlab n est pas dispo, on leve une exception claire.
     try:
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
