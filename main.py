@@ -49,8 +49,17 @@ BOVINE_AUTOSOMES = [str(i) for i in range(1, 30)]
 def _hash_ndarray(x):
     if not isinstance(x, np.ndarray) or x.size == 0:
         return "empty"
-    return (str(x.shape) + "|" + str(x.dtype) + "|" +
-            str(float(np.nansum(x))))
+    # Cas tableau de chaines (FID, IID, etc)
+    if x.dtype.kind in ("U", "S", "O"):
+        preview = "|".join(str(v) for v in x.ravel()[:500])
+        return ("strarr|" + str(x.shape) + "|" + preview)
+    # Cas numerique
+    try:
+        return (str(x.shape) + "|" + str(x.dtype) + "|" +
+                str(float(np.nansum(x))) + "|" +
+                str(float(np.nansum(np.abs(x)))))
+    except Exception:
+        return "ndarray|" + str(x.shape) + "|" + str(x.dtype)
 
 
 HASH_FUNCS = {np.ndarray: _hash_ndarray}
