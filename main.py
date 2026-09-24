@@ -2639,31 +2639,30 @@ def main():
     if not has_data():
         st.info("👉 Générez un jeu de démo, importez PED/MAP ou VCF, "
                 "ou utilisez le convertisseur Axiom → PED.")
-        st.markdown("""
-### 🧬 Pipeline complet v5.0
-
-| Phase | Module | Sortie |
-|---|---|---|
-| 1 | Nettoyage PED + autosomes | Cattle.ped propre |
-| 2 | QC (missing, MAF, HWE, het) | Cattle_QC_Clean |
-| 3 | LD Pruning | SNPs indépendants |
-| 4 | KING + PCA + MDS + FST | Structure |
-| 5 | Admixture (NMF + CV) | Ancestralités Q |
-| 6 | LD decay · ROH · SNeP | Démographie |
-| 7 | Reynolds · NJ · Sélection | Publication |
-| 8 | GWAS (LMM-EMMAX) | Manhattan + QQ + LocusZoom |
-| 9 | **Fine-mapping (ABF)** | Credible sets |
-| 10 | **Annotation VEP** | Gène, impact, consequence |
-| 11 | **Enrichissement GO/KEGG** | Voies biologiques |
-| 12 | **Rapport PDF** | Livrable publication |
-
-### 🎁 Nouveautés v5.0
-- ✅ Fine-mapping bayésien (credible sets 95%)
-- ✅ Annotation fonctionnelle Ensembl VEP
-- ✅ Enrichissement g:Profiler (GO/KEGG/Reactome)
-- ✅ Rapport PDF complet avec figures et tableaux
-- ✅ Toutes les analyses v4.0 conservées
-        """)
+                pipeline_md = (
+            "### Pipeline complet v5.0\n\n"
+            "| Phase | Module | Sortie |\n"
+            "|---|---|---|\n"
+            "| 1 | Nettoyage PED + autosomes | Cattle.ped propre |\n"
+            "| 2 | QC (missing, MAF, HWE, het) | Cattle_QC_Clean |\n"
+            "| 3 | LD Pruning | SNPs independants |\n"
+            "| 4 | KING + PCA + MDS + FST | Structure |\n"
+            "| 5 | Admixture (NMF + CV) | Ancestralites Q |\n"
+            "| 6 | LD decay / ROH / SNeP | Demographie |\n"
+            "| 7 | Reynolds / NJ / Selection | Publication |\n"
+            "| 8 | GWAS (LMM-EMMAX) | Manhattan + QQ + LocusZoom |\n"
+            "| 9 | **Fine-mapping (ABF)** | Credible sets |\n"
+            "| 10 | **Annotation VEP** | Gene, impact, consequence |\n"
+            "| 11 | **Enrichissement GO/KEGG** | Voies biologiques |\n"
+            "| 12 | **Rapport PDF** | Livrable publication |\n\n"
+            "### Nouveautes v5.0\n"
+            "- Fine-mapping bayesien (credible sets 95%)\n"
+            "- Annotation fonctionnelle Ensembl VEP\n"
+            "- Enrichissement g:Profiler (GO/KEGG/Reactome)\n"
+            "- Rapport PDF complet avec figures et tableaux\n"
+            "- Toutes les analyses v4.0 conservees\n"
+        )
+        st.markdown(pipeline_md)
         return
 
     gt = st.session_state.gt
