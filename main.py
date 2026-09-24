@@ -2434,7 +2434,7 @@ def main():
 
             st.divider()
             st.subheader("Export Structure")
-            if st.session_state.pca_scores is not None:
+                        if st.session_state.pca_scores is not None:
                 n_pc = min(10, st.session_state.pca_scores.shape[1])
                 pca_df = pd.DataFrame(
                     st.session_state.pca_scores[:, :n_pc],
@@ -2443,10 +2443,16 @@ def main():
                               st.session_state.ind_filt["FID"].values)
                 pca_df.insert(1, "IID",
                               st.session_state.ind_filt["IID"].values)
-                pca_df["Variance_pct"] = list(
-                    st.session_state.pca_var[:n_pc])
                 export_csv_button(pca_df, "pca_scores.csv", "dl_pca",
-                                  "Telecharger PCA (CSV)")
+                                  "Telecharger PCA scores (CSV)")
+
+                var_df = pd.DataFrame({
+                    "PC": ["PC" + str(i + 1) for i in range(n_pc)],
+                    "Variance_pct": list(
+                        st.session_state.pca_var[:n_pc])})
+                export_csv_button(var_df, "pca_variance.csv",
+                                  "dl_pca_var",
+                                  "Telecharger PCA variance (CSV)")
 
             if st.session_state.mds_coords is not None:
                 n_mds = min(10, st.session_state.mds_coords.shape[1])
