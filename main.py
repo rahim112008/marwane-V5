@@ -644,7 +644,7 @@ def selection_signatures(gt, snp_df, pop_labels):
 
 @cache_data
 def detect_roh(gt, snp_df_json, min_snps=30, min_kb=500.0):
-    snp_df = pd.read_json(snp_df_json)
+    snp_df = pd.read_json(io.StringIO(snp_df_json))
     chr_arr = snp_df["CHR"].astype(str).values
     bp = snp_df["BP"].astype(np.int64).values
     n_ind = gt.shape[0]
