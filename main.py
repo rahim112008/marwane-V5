@@ -1,7 +1,7 @@
 """
 Bovine SNP Platform v5.0 - Version complete et finale
 Chargement + QC + LD + Structure + GWAS + Selection + Demographie
-+ Admixture + Phylogenie + Export + Axiom + Rapport PDF
++ Admixture + Phylogenie (arbre NJ) + Export + Axiom + Rapport PDF
 """
 import gzip
 import io
@@ -53,6 +53,15 @@ ARS_UCD12_LENGTHS = {
     "29": 51319414, "X": 139009144, "Y": 50927933, "MT": 16338,
 }
 BOVINE_AUTOSOMES = [str(i) for i in range(1, 30)]
+
+RACE_POOL = ["AND", "EBG", "ELN", "EZP", "FGN", "LJR", "NAR",
+             "NBD", "NKA", "PRS", "PSH", "PTP", "SHO", "YBS"]
+
+RACE_COLORS = [
+    "#e74c3c", "#f39c12", "#f1c40f", "#2ecc71", "#1abc9c",
+    "#3498db", "#9b59b6", "#e84393", "#fd79a8", "#00b894",
+    "#0984e3", "#a29bfe", "#fab1a0", "#55a3e8",
+]
 
 
 def _hash_ndarray(x):
@@ -346,8 +355,7 @@ def render_axiom_converter_page():
             with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as zf:
                 zf.writestr("converted.ped", ped_text)
                 zf.writestr("converted.map", map_text)
-            st.download_button(".zip",
-                               data=bio.getvalue(),
+            st.download_button(".zip", data=bio.getvalue(),
                                file_name="converted_ped_map.zip",
                                mime="application/zip",
                                use_container_width=True)
@@ -491,12 +499,10 @@ def parse_ped(ped_bytes, n_snp_map):
     return gt, ind_df, rejected_short + rejected_empty
 
 
-def generate_demo_data(n_ind=150, n_snp=800, n_pop=4, seed=42):
+def generate_demo_data(n_ind=350, n_snp=2000, n_pop=14, seed=42):
     rng = np.random.default_rng(seed)
-    pool = ["AND", "EBG", "ELN", "EZP", "FGN", "LJR", "NAR",
-            "NBD", "NKA", "PRS", "PSH", "PTP", "SHO", "YBS"]
-    n_pop = max(1, min(n_pop, len(pool)))
-    pop_names = pool[:n_pop]
+    n_pop = max(1, min(n_pop, len(RACE_POOL)))
+    pop_names = RACE_POOL[:n_pop]
 
     per_pop = n_ind // n_pop
     remainder = n_ind - per_pop * n_pop
@@ -951,6 +957,58 @@ def nj_tree_newick(D, labels):
         return "Erreur NJ : " + str(e)
 
 
+def plot_phylogenetic_tree(D, labels):
+    try:
+        from scipy.cluster.hierarchy import linkage, dendrogram
+        from scipy.spatial.distance import squareform
+    except ImportError:
+        return None
+
+    if D is None or len(labels) < 2:
+        return None
+
+    Dm = squareform(D, checks=False)
+    Z = linkage(Dm, method="average")
+    dendro = dendrogram(Z, labels=[str(l) for l in labels], no_plot=True)
+
+    icoord = dendro["icoord"]
+    dcoord = dendro["dcoord"]
+
+    fig = go.Figure()
+
+    for xs, ys in zip(icoord, dcoord):
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="lines",
+            line=dict(color="black", width=1.8),
+            hoverinfo="skip", showlegend=False))
+
+    leaves = dendro["ivl"]
+    n_leaves = len(leaves)
+    leaf_x = [5 + 10 * i for i in range(n_leaves)]
+    leaf_y = [0] * n_leaves
+
+    fig.add_trace(go.Scatter(
+        x=leaf_x, y=leaf_y, mode="text",
+        text=leaves, textposition="bottom center",
+        textfont=dict(size=13, color="darkblue", family="Arial"),
+        showlegend=False, hoverinfo="skip"))
+
+    max_dist = max(max(ys) for ys in dcoord) if dcoord else 1.0
+
+    fig.update_layout(
+        title=dict(text="Arbre phylogenetique (Reynolds + NJ)",
+                   x=0.5, xanchor="center",
+                   font=dict(size=16, color="darkblue")),
+        xaxis=dict(showticklabels=False, showgrid=False,
+                   zeroline=False, title=""),
+        yaxis=dict(title="Distance genetique",
+                   showgrid=True, gridcolor="lightgray",
+                   range=[0, max_dist * 1.15]),
+        height=600, plot_bgcolor="white",
+        margin=dict(l=80, r=40, t=80, b=40))
+    return fig
+
+
 @cache_data
 def detect_roh(gt, snp_df_json, min_snps=30, min_kb=500.0):
     snp_df = pd.read_json(io.StringIO(snp_df_json))
@@ -1090,52 +1148,37 @@ def match_phenotypes(ind_df, pheno_df, iid_col=None):
                 iid_col = c
                 break
     if iid_col is None:
-        raise ValueError("Aucune colonne IID/Animal trouvee. Dispo : " +
+        raise ValueError("Aucune colonne IID trouvee. Colonnes dispo : " +
                          str(list(pheno_df.columns)))
 
     p = pheno_df.copy()
     ind = ind_df.copy()
 
-    # Normalisation de base
-    p["_key_raw"] = p[iid_col].astype(str).str.strip()
-    ind["_key_raw"] = ind["IID"].astype(str).str.strip()
+    p["_key"] = p[iid_col].astype(str).str.strip()
+    ind["_key"] = ind["IID"].astype(str).str.strip()
 
-    # Essai 1 : correspondance stricte
-    common = set(p["_key_raw"]) & set(ind["_key_raw"])
-    if len(common) >= 10:
-        p["_key"] = p["_key_raw"]
-        ind["_key"] = ind["_key_raw"]
-        st.info("Matching strict : " + str(len(common)) +
-                " individus matches.")
-    else:
-        # Essai 2 : extraire les NUMEROS des IID et comparer
-        def extract_number(s):
-            import re
-            s = str(s)
-            # Trouve tous les nombres dans la chaine
-            nums = re.findall(r"\d+", s)
+    common = set(p["_key"]) & set(ind["_key"])
+    if len(common) < 10:
+        import re
+
+        def extract_num(s):
+            nums = re.findall(r"\d+", str(s))
             if nums:
-                # Prend le plus long (souvent le numero animal)
                 return max(nums, key=len)
-            return s
+            return str(s)
 
-        p["_key"] = p["_key_raw"].apply(extract_number)
-        ind["_key"] = ind["_key_raw"].apply(extract_number)
-
+        p["_key"] = p["_key"].apply(extract_num)
+        ind["_key"] = ind["_key"].apply(extract_num)
         common2 = set(p["_key"]) & set(ind["_key"])
         st.info("Matching par numero : " + str(len(common2)) +
                 " individus matches.")
-        st.caption("Exemple genotype : " +
-                   str(ind["_key_raw"].iloc[0]) +
-                   " -> cle " + str(ind["_key"].iloc[0]))
-        st.caption("Exemple phenotype : " +
-                   str(p["_key_raw"].iloc[0]) +
-                   " -> cle " + str(p["_key"].iloc[0]))
+    else:
+        st.info("Matching strict : " + str(len(common)) +
+                " individus matches.")
 
     merged = ind[["_key", "FID", "IID"]].merge(
-        p.drop(columns=[iid_col, "_key_raw"]),
-        on="_key", how="left", suffixes=("", "_pheno"))
-    merged = merged.drop(columns=["_key"])
+        p.drop(columns=[iid_col]), on="_key", how="left")
+    merged = merged.drop(columns="_key")
     return merged, iid_col
 
 
@@ -1403,25 +1446,37 @@ def build_plink_zip(gt, ind_df, snp_df, prefix="bovine_qc"):
     return bio.getvalue()
 
 
-def plot_hist(values, title, xlabel, color="#3498db"):
+def plot_hist(values, title, xlabel, color="#3498db",
+              xlim=None, breaks=100):
     fig = go.Figure()
-    fig.add_trace(go.Histogram(x=values, nbinsx=80, marker_color=color))
+    fig.add_trace(go.Histogram(
+        x=values, nbinsx=breaks, marker_color=color,
+        marker_line=dict(color="black", width=0.3)))
+    if xlim is not None:
+        fig.update_xaxes(range=xlim)
     fig.update_layout(title=title, xaxis_title=xlabel,
-                      yaxis_title="Frequence", height=380,
+                      yaxis_title="Frequency", height=400,
                       margin=dict(l=40, r=20, t=50, b=40))
     return fig
 
 
 def plot_missingness_dashboard(miss_ind, miss_snp):
     fig = make_subplots(rows=1, cols=2,
-                        subplot_titles=("Missingness / individu",
-                                        "Missingness / SNP"))
-    fig.add_trace(go.Histogram(x=miss_ind, nbinsx=60,
-                               marker_color="skyblue"), row=1, col=1)
-    fig.add_trace(go.Histogram(x=miss_snp, nbinsx=60,
-                               marker_color="coral"), row=1, col=2)
+                        subplot_titles=("individual missingness",
+                                        "loci missingness"))
+    fig.add_trace(go.Histogram(x=miss_ind, nbinsx=100,
+                               marker_color="skyblue",
+                               marker_line=dict(color="black", width=0.3)),
+                  row=1, col=1)
+    fig.add_trace(go.Histogram(x=miss_snp, nbinsx=100,
+                               marker_color="coral",
+                               marker_line=dict(color="black", width=0.3)),
+                  row=1, col=2)
     fig.update_layout(height=400, showlegend=False,
                       margin=dict(l=40, r=20, t=60, b=40))
+    fig.update_xaxes(title_text="missingness frequency", row=1, col=1)
+    fig.update_xaxes(title_text="missingness frequency", row=1, col=2)
+    fig.update_yaxes(title_text="Frequency", row=1, col=1)
     return fig
 
 
@@ -1432,32 +1487,72 @@ def plot_ld_decay(ld_df, bin_kb=20):
     d["bin"] = (d["dist_kb"] // bin_kb) * bin_kb
     agg = d.groupby("bin")["r2"].mean().reset_index()
     fig = px.line(agg, x="bin", y="r2",
-                  labels={"bin": "Distance (kb)", "r2": "r2 moyen"},
+                  labels={"bin": "Physical Distance (Kb)",
+                          "r2": "Linkage Disequilibrium (r2)"},
                   title="LD decay", height=450)
-    fig.update_traces(line=dict(color="royalblue", width=3))
+    fig.update_traces(line=dict(color="royalblue", width=2),
+                      mode="lines+markers",
+                      marker=dict(size=4, color="royalblue"))
+    fig.update_layout(plot_bgcolor="white")
     return fig
 
 
 def plot_pca(scores, var_pct, labels):
-    df = pd.DataFrame({"PC1": scores[:, 0], "PC2": scores[:, 1],
-                       "Population": labels})
-    fig = px.scatter(df, x="PC1", y="PC2", color="Population",
-                     title=("PCA - PC1 (" + str(round(var_pct[0], 1)) +
-                            " pct) vs PC2 (" +
-                            str(round(var_pct[1], 1)) + " pct)"),
-                     height=550)
-    fig.update_traces(marker=dict(size=10,
-                                  line=dict(width=1, color="white")))
+    df = pd.DataFrame({
+        "PC1": scores[:, 0], "PC2": scores[:, 1],
+        "Population": labels})
+    races = sorted(df["Population"].unique())
+    n_races = len(races)
+    symbols = ["circle", "square", "diamond", "triangle-up",
+               "triangle-down", "pentagon", "hexagon", "star",
+               "cross", "x", "circle-open", "square-open",
+               "diamond-open", "triangle-up-open"]
+    fig = go.Figure()
+    for i, race in enumerate(races):
+        sub = df[df["Population"] == race]
+        fig.add_trace(go.Scatter(
+            x=sub["PC1"], y=sub["PC2"], mode="markers",
+            name=str(race),
+            marker=dict(size=10,
+                        color=RACE_COLORS[i % len(RACE_COLORS)],
+                        symbol=symbols[i % len(symbols)],
+                        line=dict(width=1, color="white"))))
+    fig.add_hline(y=0, line_dash="dot", line_color="gray")
+    fig.add_vline(x=0, line_dash="dot", line_color="gray")
+    fig.update_layout(
+        title="Population Structure - PCA",
+        xaxis_title="Principal Component 1 (" +
+                    str(round(var_pct[0], 2)) + " %)",
+        yaxis_title="Principal Component 2 (" +
+                    str(round(var_pct[1], 2)) + " %)",
+        height=600,
+        legend=dict(x=1.02, y=1, xanchor="left"),
+        plot_bgcolor="white")
     return fig
 
 
 def plot_mds(coords, labels):
-    df = pd.DataFrame({"MDS1": coords[:, 0], "MDS2": coords[:, 1],
-                       "Population": labels})
-    fig = px.scatter(df, x="MDS1", y="MDS2", color="Population",
-                     title="MDS (IBS) - Structure", height=550)
-    fig.update_traces(marker=dict(size=10,
-                                  line=dict(width=1, color="white")))
+    df = pd.DataFrame({
+        "MDS1": coords[:, 0], "MDS2": coords[:, 1],
+        "Population": labels})
+    races = sorted(df["Population"].unique())
+    fig = go.Figure()
+    for i, race in enumerate(races):
+        sub = df[df["Population"] == race]
+        fig.add_trace(go.Scatter(
+            x=sub["MDS1"], y=sub["MDS2"], mode="markers",
+            name=str(race),
+            marker=dict(size=10,
+                        color=RACE_COLORS[i % len(RACE_COLORS)],
+                        line=dict(width=1, color="white"))))
+    fig.update_layout(
+        title="Population Structure Analysis (MDS Plot)",
+        xaxis_title="Dimension 1", yaxis_title="Dimension 2",
+        height=600,
+        legend=dict(x=0, y=0, xanchor="left", yanchor="bottom",
+                    bgcolor="rgba(255,255,255,0.8)",
+                    bordercolor="black", borderwidth=1),
+        plot_bgcolor="white")
     return fig
 
 
@@ -1496,9 +1591,9 @@ def plot_manhattan(fst, chr_col, threshold_q=0.999):
                   annotation_text="Top " +
                   str(round(100 * (1 - threshold_q), 1)) + " pct",
                   annotation_position="top right")
-    fig.update_layout(title="Manhattan FST/SNP",
+    fig.update_layout(title="Manhattan Plot - FST/SNP",
                       xaxis_title="Chromosome", yaxis_title="FST",
-                      height=500)
+                      height=500, plot_bgcolor="white")
     fig.update_xaxes(tickvals=ticks, ticktext=labels)
     return fig
 
@@ -1509,14 +1604,25 @@ def plot_fst_pairwise(matrix, pops):
         colorbar=dict(title="FST"),
         text=np.round(matrix, 4), texttemplate="%{text}",
         hovertemplate="%{y} vs %{x}<br>FST = %{z:.4f}<extra></extra>"))
-    fig.update_layout(title="FST pairwise", height=550)
+    fig.update_layout(title="FST pairwise", height=600)
     return fig
 
 
 def plot_roh_histogram(froh, labels):
     df = pd.DataFrame({"FROH": froh, "Population": labels})
-    return px.histogram(df, x="FROH", color="Population", nbins=50,
-                        title="Distribution de FROH", height=450)
+    races = sorted(df["Population"].unique())
+    fig = go.Figure()
+    for i, race in enumerate(races):
+        sub = df[df["Population"] == race]
+        fig.add_trace(go.Histogram(
+            x=sub["FROH"], name=str(race), nbinsx=50,
+            marker_color=RACE_COLORS[i % len(RACE_COLORS)],
+            opacity=0.7))
+    fig.update_layout(barmode="overlay",
+                      title="Distribution de FROH",
+                      xaxis_title="FROH", yaxis_title="Frequency",
+                      height=500, plot_bgcolor="white")
+    return fig
 
 
 def plot_ne_curves(ne_dict):
@@ -1527,12 +1633,81 @@ def plot_ne_curves(ne_dict):
         if df is None or df.empty:
             continue
         fig.add_trace(go.Scatter(x=df["GenAgo"], y=df["Ne"],
-                                 mode="lines+markers", name=race,
+                                 mode="lines+markers", name=str(race),
                                  line=dict(color=palette[i % len(palette)],
-                                           width=3)))
-    fig.update_layout(title="Ne historique (SNeP-like)",
+                                           width=2),
+                                 marker=dict(size=4)))
+    fig.update_layout(title="Evolution de la taille efficace (Ne)",
                       xaxis_title="Generations passees",
-                      yaxis_title="Ne (relatif)", height=550)
+                      yaxis_title="Taille efficace (Ne)",
+                      height=550, plot_bgcolor="white")
+    return fig
+
+
+def plot_ne_facet(ne_dict, n_cols=4):
+    if not ne_dict:
+        return None
+    all_data = []
+    for race, df in ne_dict.items():
+        if df is None or df.empty:
+            continue
+        d = df.copy()
+        d["Race"] = str(race)
+        all_data.append(d)
+    if not all_data:
+        return None
+    combined = pd.concat(all_data, ignore_index=True)
+    combined = combined[combined["GenAgo"] <= 750]
+
+    races = sorted(combined["Race"].unique())
+    n_races = len(races)
+    n_rows = (n_races + n_cols - 1) // n_cols
+
+    palette = RACE_COLORS
+
+    fig = make_subplots(
+        rows=n_rows, cols=n_cols,
+        subplot_titles=races,
+        horizontal_spacing=0.06,
+        vertical_spacing=0.12)
+
+    for i, race in enumerate(races):
+        row = i // n_cols + 1
+        col = i % n_cols + 1
+        sub = combined[combined["Race"] == race].sort_values("GenAgo")
+        color = palette[i % len(palette)]
+        fig.add_trace(
+            go.Scatter(x=sub["GenAgo"], y=sub["Ne"],
+                       mode="lines+markers", name=race,
+                       line=dict(color=color, width=2),
+                       marker=dict(size=4, color=color),
+                       showlegend=False,
+                       hovertemplate="Gen=%{x}<br>Ne=%{y:.0f}<extra></extra>"),
+            row=row, col=col)
+
+    fig.update_layout(
+        title=dict(
+            text="Tendance de la Taille Efficace (Ne) par Race",
+            x=0.5, xanchor="center",
+            font=dict(size=18, color="darkblue")),
+        height=250 * n_rows,
+        margin=dict(l=60, r=40, t=80, b=60),
+        plot_bgcolor="white")
+
+    for i in range(1, n_rows + 1):
+        for j in range(1, n_cols + 1):
+            idx = (i - 1) * n_cols + (j - 1)
+            if idx >= n_races:
+                continue
+            fig.update_xaxes(title_text="Gen. passees", row=i, col=j,
+                             title_font=dict(size=10))
+            fig.update_yaxes(title_text="Ne", row=i, col=j,
+                             title_font=dict(size=10))
+
+    for ann in fig.layout.annotations:
+        if ann.text in races:
+            ann.font = dict(size=13, color="darkblue", family="Arial")
+
     return fig
 
 
@@ -1550,7 +1725,8 @@ def plot_cv_error(cv_results):
                   annotation_text="K optimal = " + str(k_opt),
                   annotation_position="top")
     fig.update_layout(title="CV Error (choix K)",
-                      xaxis_title="K", yaxis_title="CV Error", height=450)
+                      xaxis_title="K", yaxis_title="CV Error",
+                      height=450, plot_bgcolor="white")
     return fig
 
 
@@ -1563,8 +1739,8 @@ def plot_admixture(Q, labels, pop_labels, K):
                                categories=sorted(set(pop_labels)))
     df = df.sort_values(["_po", "_dom"]).reset_index(drop=True)
     df["x"] = np.arange(len(df))
-    palette = (px.colors.qualitative.Set2
-               + px.colors.qualitative.Set3)[:K]
+    palette = RACE_COLORS[:K]
+
     fig = go.Figure()
     for k in range(K):
         fig.add_trace(go.Bar(
@@ -1574,10 +1750,29 @@ def plot_admixture(Q, labels, pop_labels, K):
             hovertemplate="Ind %{customdata}<br>K" + str(k + 1)
                           + " = %{y:.2f}<extra></extra>",
             customdata=df["IID"]))
-    fig.update_layout(barmode="stack",
-                      title="Ancestralite (K=" + str(K) + ")",
-                      xaxis_title="Individus tries",
-                      yaxis_title="Proportion", height=500)
+
+    sorted_pops = df["Pop"].values
+    bounds = []
+    for i in range(1, len(df)):
+        if sorted_pops[i] != sorted_pops[i - 1]:
+            bounds.append(i)
+    for b in bounds:
+        fig.add_vline(x=b - 0.5, line_color="black", line_width=1)
+
+    unique_pops = list(df["Pop"].unique())
+    tick_pos = []
+    for pop in unique_pops:
+        idx = df.index[df["Pop"] == pop]
+        tick_pos.append((idx[0] + idx[-1]) / 2)
+    fig.update_xaxes(tickvals=tick_pos,
+                     ticktext=[str(p) for p in unique_pops],
+                     tickangle=-45)
+
+    fig.update_layout(
+        barmode="stack",
+        title="Structure de la population (K=" + str(K) + ")",
+        xaxis_title="", yaxis_title="Ancestry Fractions",
+        height=500, bargap=0, plot_bgcolor="white")
     return fig, df
 
 
@@ -1640,7 +1835,8 @@ def plot_gwas_manhattan(res_df, bonferroni=None, fdr=None,
                       annotation_position="bottom right")
 
     fig.update_layout(title=title, xaxis_title="Chromosome",
-                      yaxis_title="-log10(P)", height=520)
+                      yaxis_title="-log10(P)", height=520,
+                      plot_bgcolor="white")
     fig.update_xaxes(tickvals=ticks, ticktext=labels)
     return fig
 
@@ -1668,7 +1864,8 @@ def plot_gwas_qq(pvals, lambda_gc=None):
            if lambda_gc is not None and np.isfinite(lambda_gc) else "")
     fig.update_layout(title="QQ plot " + sub,
                       xaxis_title="Attendu -log10(P)",
-                      yaxis_title="Observe -log10(P)", height=520)
+                      yaxis_title="Observe -log10(P)",
+                      height=520, plot_bgcolor="white")
     return fig
 
 
@@ -1698,7 +1895,7 @@ def plot_locuszoom(res_df, snp_df, chrom, center_bp, window_kb=500):
         title="LocusZoom - CHR " + chrom + " : " +
               str(round(center_bp / 1e6, 2)) + " Mb",
         xaxis_title="Position (Mb)",
-        yaxis_title="-log10(P)", height=500)
+        yaxis_title="-log10(P)", height=500, plot_bgcolor="white")
     return fig
 
 
@@ -1780,8 +1977,7 @@ def build_pdf_report(project_name, qc_stats, sections):
                                         TableStyle, PageBreak)
         from reportlab.lib import colors
     except ImportError:
-        raise ImportError(
-            "pip install reportlab kaleido\nPuis relancez.")
+        raise ImportError("pip install reportlab kaleido")
 
     bio = BytesIO()
     doc = SimpleDocTemplate(bio, pagesize=A4,
@@ -1795,10 +1991,10 @@ def build_pdf_report(project_name, qc_stats, sections):
     h2 = ParagraphStyle("H2", parent=styles["Heading2"],
                         textColor=HexColor("#2471a3"), fontSize=14,
                         spaceAfter=8)
-    body = ParagraphStyle("Body", parent=styles["BodyText"], fontSize=10,
-                          leading=14, spaceAfter=6)
-    small = ParagraphStyle("Small", parent=styles["BodyText"], fontSize=8,
-                           leading=10)
+    body = ParagraphStyle("Body", parent=styles["BodyText"],
+                          fontSize=10, leading=14, spaceAfter=6)
+    small = ParagraphStyle("Small", parent=styles["BodyText"],
+                           fontSize=8, leading=10)
 
     story = []
     story.append(Spacer(1, 3 * cm))
@@ -1807,7 +2003,8 @@ def build_pdf_report(project_name, qc_stats, sections):
     story.append(Spacer(1, 1 * cm))
     story.append(Paragraph("Projet : " + str(project_name), body))
     story.append(Paragraph("Date : " +
-                           datetime.now().strftime("%Y-%m-%d %H:%M"), body))
+                           datetime.now().strftime("%Y-%m-%d %H:%M"),
+                           body))
     story.append(Spacer(1, 1 * cm))
 
     if qc_stats:
@@ -1858,10 +2055,11 @@ def build_pdf_report(project_name, qc_stats, sections):
             if fig is None:
                 continue
             try:
-                png = fig.to_image(format="png", width=900, height=550,
-                                   scale=1.5)
+                png = fig.to_image(format="png", width=900,
+                                   height=550, scale=1.5)
                 story.append(Image(BytesIO(png), width=17 * cm,
-                                   height=10 * cm, kind="proportional"))
+                                   height=10 * cm,
+                                   kind="proportional"))
                 story.append(Spacer(1, 0.4 * cm))
             except Exception as e:
                 story.append(Paragraph("[Figure non incluse : " +
@@ -1925,10 +2123,20 @@ def _fid_array():
     return st.session_state.ind_filt["FID"].astype(str).to_numpy()
 
 
+def export_csv_button(df, filename, key, label="Telecharger CSV"):
+    if df is None or (hasattr(df, "empty") and df.empty):
+        return
+    csv = df.to_csv(index=False).encode("utf-8")
+    st.download_button(label, data=csv, file_name=filename,
+                       mime="text/csv", key=key,
+                       use_container_width=True)
+
+
 def main():
     init_state()
     st.title("Bovine SNP Platform v5.0")
-    st.caption("Pipeline complet v5.0 - Toutes les analyses")
+    st.caption("Pipeline complet - QC / LD / Structure / GWAS / "
+               "Selection / Demographie / Admixture / Phylogenie / PDF")
 
     with st.sidebar:
         st.header("Donnees")
@@ -1939,11 +2147,12 @@ def main():
 
         if mode == "Demo":
             c1, c2 = st.columns(2)
-            n_ind = c1.number_input("Individus", 20, 1000, 150, 10,
+            n_ind = c1.number_input("Individus", 20, 2000, 350, 10,
                                     key="sb_n_ind")
-            n_snp = c2.number_input("SNPs", 100, 10000, 800, 100,
+            n_snp = c2.number_input("SNPs", 100, 20000, 2000, 100,
                                     key="sb_n_snp")
-            n_pop = st.slider("Populations", 2, 10, 4, key="sb_n_pop")
+            n_pop = st.slider("Populations (races)", 2, 14, 14,
+                              key="sb_n_pop")
             if st.button("Generer le jeu de demo",
                          use_container_width=True, key="sb_btn_demo"):
                 with st.spinner("Generation..."):
@@ -2008,6 +2217,9 @@ def main():
         ld_r2 = st.slider("LD Pruning r2", 0.05, 0.5,
                           DEFAULT_THRESHOLDS["ld_r2"], 0.05,
                           key="sb_ld_r2")
+        king_cutoff = st.slider("KING cutoff", 0.1, 0.5,
+                                DEFAULT_THRESHOLDS["king_cutoff"], 0.01,
+                                key="sb_king")
 
     if st.session_state.get("sb_mode_source") == "Convertisseur Axiom":
         render_axiom_converter_page()
@@ -2026,6 +2238,7 @@ def main():
                     "Admixture", "Phylogenie", "Export",
                     "Rapport PDF"])
 
+    # ============ TAB 0 : Apercu ============
     with tabs[0]:
         step_header("0", "Apercu", "Comptage.", "Coherence.",
                     "Apercu visuel.")
@@ -2038,10 +2251,12 @@ def main():
         st.subheader("SNPs")
         st.dataframe(snp_df.head(5), use_container_width=True)
 
+    # ============ TAB 1 : QC ============
     with tabs[1]:
         st.subheader("Controle Qualite (QC)")
         step_header("3", "QC", "Cascade filtres.", "Nettoyage.",
                     "Dataset propre.")
+
         if st.button("Filtrer autosomes 1-29", key="qc_btn_auto"):
             try:
                 gt_a, snp_a = filter_autosomes(st.session_state.gt,
@@ -2092,14 +2307,15 @@ def main():
             c1, c2 = st.columns(2)
             with c1:
                 st.plotly_chart(
-                    plot_hist(maf(gt_full), "Spectre MAF",
-                              "MAF", "#2ecc71"),
+                    plot_hist(maf(gt_full), "Allele spectrum frequency",
+                              "Alleles frequencies", "#8FBC8F",
+                              xlim=(0, 0.5), breaks=50),
                     use_container_width=True, key="qc_plot_maf")
             with c2:
                 st.plotly_chart(
                     plot_hist(heterozygosity(gt_full),
                               "Heterozygotie observee",
-                              "HET", "#9b59b6"),
+                              "HET", "#9b59b6", breaks=100),
                     use_container_width=True, key="qc_plot_het")
 
             st.divider()
@@ -2109,6 +2325,26 @@ def main():
             st.json(qc_interp["metrics"])
             st.info(qc_interp["recommendation"])
 
+            st.divider()
+            st.subheader("Export QC")
+            df_qc = pd.DataFrame({
+                "FID": st.session_state.ind_filt["FID"].values,
+                "IID": st.session_state.ind_filt["IID"].values,
+                "F_MISS": missingness_per_ind(st.session_state.gt_filt),
+                "HET": heterozygosity(st.session_state.gt_filt)})
+            export_csv_button(df_qc, "qc_individuals.csv", "dl_qc_ind",
+                              "Telecharger QC individus (CSV)")
+
+            df_snp_qc = pd.DataFrame({
+                "CHR": st.session_state.snp_filt["CHR"].values,
+                "SNP": st.session_state.snp_filt["SNP"].values,
+                "BP": st.session_state.snp_filt["BP"].values,
+                "F_MISS": missingness_per_snp(st.session_state.gt_filt),
+                "MAF": maf(st.session_state.gt_filt)})
+            export_csv_button(df_snp_qc, "qc_snps.csv", "dl_qc_snp",
+                              "Telecharger QC SNPs (CSV)")
+
+    # ============ TAB 2 : LD Pruning ============
     with tabs[2]:
         st.subheader("LD Pruning")
         step_header("4.5", "LD Pruning", "Elagage.", "Independance.",
@@ -2152,7 +2388,11 @@ def main():
                 if fig:
                     st.plotly_chart(fig, use_container_width=True,
                                     key="ld_plot_decay")
+                if not ld_df.empty:
+                    export_csv_button(ld_df, "ld_decay.csv", "dl_ld",
+                                      "Telecharger LD decay (CSV)")
 
+    # ============ TAB 3 : Structure ============
     with tabs[3]:
         st.subheader("Structure")
         step_header("5.3-5.4", "PCA MDS KING", "Reduction dim.",
@@ -2182,14 +2422,58 @@ def main():
                     plot_pca(st.session_state.pca_scores,
                              st.session_state.pca_var, _fid_array()),
                     use_container_width=True, key="struct_plot_pca")
+
             if st.session_state.mds_coords is not None:
                 st.plotly_chart(
                     plot_mds(st.session_state.mds_coords, _fid_array()),
                     use_container_width=True, key="struct_plot_mds")
+
             if st.session_state.king_matrix is not None:
                 st.info("KING shape : " +
                         str(st.session_state.king_matrix.shape))
 
+            st.divider()
+            st.subheader("Export Structure")
+            if st.session_state.pca_scores is not None:
+                n_pc = min(10, st.session_state.pca_scores.shape[1])
+                pca_df = pd.DataFrame(
+                    st.session_state.pca_scores[:, :n_pc],
+                    columns=["PC" + str(i + 1) for i in range(n_pc)])
+                pca_df.insert(0, "FID",
+                              st.session_state.ind_filt["FID"].values)
+                pca_df.insert(1, "IID",
+                              st.session_state.ind_filt["IID"].values)
+                pca_df["Variance_pct"] = list(
+                    st.session_state.pca_var[:n_pc])
+                export_csv_button(pca_df, "pca_scores.csv", "dl_pca",
+                                  "Telecharger PCA (CSV)")
+
+            if st.session_state.mds_coords is not None:
+                n_mds = min(10, st.session_state.mds_coords.shape[1])
+                mds_df = pd.DataFrame(
+                    st.session_state.mds_coords[:, :n_mds],
+                    columns=["C" + str(i + 1) for i in range(n_mds)])
+                mds_df.insert(0, "FID",
+                              st.session_state.ind_filt["FID"].values)
+                mds_df.insert(1, "IID",
+                              st.session_state.ind_filt["IID"].values)
+                export_csv_button(mds_df, "mds_scores.csv", "dl_mds",
+                                  "Telecharger MDS (CSV)")
+
+            if st.session_state.king_matrix is not None:
+                K = st.session_state.king_matrix
+                n = K.shape[0]
+                iu, ju = np.triu_indices(n, k=1)
+                king_df = pd.DataFrame({
+                    "FID1": st.session_state.ind_filt["FID"].values[iu],
+                    "IID1": st.session_state.ind_filt["IID"].values[iu],
+                    "FID2": st.session_state.ind_filt["FID"].values[ju],
+                    "IID2": st.session_state.ind_filt["IID"].values[ju],
+                    "KINSHIP": K[iu, ju]})
+                export_csv_button(king_df, "king_kinship.csv", "dl_king",
+                                  "Telecharger KING (CSV)")
+
+    # ============ TAB 4 : GWAS ============
     with tabs[4]:
         st.subheader("GWAS")
         step_header("Ext", "GWAS LMM-EMMAX", "Association.",
@@ -2242,7 +2526,7 @@ def main():
                         "IID": ind["IID"].astype(str).values,
                         "trait_simu": trait})
                     st.session_state.pheno_matched = merged
-                    st.success("Phenotype cree.")
+                    st.success("Phenotype cree : " + str(n) + " individus.")
 
             if st.session_state.pheno_matched is not None:
                 merged = st.session_state.pheno_matched
@@ -2275,13 +2559,30 @@ def main():
                         try:
                             pheno_vec = merged[pheno_col].to_numpy(
                                 dtype=float)
+                            n_valid = int(np.isfinite(pheno_vec).sum())
+                            st.info("Diagnostic : " + str(n_valid) +
+                                    " phenotypes valides sur " +
+                                    str(len(pheno_vec)))
+                            if n_valid < 10:
+                                st.error("Pas assez de phenotypes.")
+                                st.stop()
+
+                            if len(pheno_vec) != gt_use.shape[0]:
+                                n_min = min(len(pheno_vec),
+                                            gt_use.shape[0])
+                                pheno_vec = pheno_vec[:n_min]
+                                gt_local = gt_use[:n_min]
+                            else:
+                                gt_local = gt_use
+
                             K_use = (st.session_state.king_matrix
                                      if st.session_state.king_matrix
                                      is not None
-                                     else np.eye(len(merged)))
+                                     else np.eye(len(pheno_vec)))
+
                             with st.spinner("GWAS..."):
                                 res = run_gwas_lmm(
-                                    gt_use, pheno_vec, K_use, covs,
+                                    gt_local, pheno_vec, K_use, covs,
                                     maf_min=float(maf_thr_gwas),
                                     use_lmm=bool(use_lmm))
                                 res = annotate_gwas_results(res, snp_use)
@@ -2351,14 +2652,11 @@ def main():
                                         use_container_width=True,
                                         key="gwas_plot_locuszoom")
 
-                            csv = res.to_csv(index=False).encode("utf-8")
-                            st.download_button(
-                                "Telecharger GWAS (CSV)", data=csv,
-                                file_name="gwas_results.csv",
-                                mime="text/csv",
-                                key="gwas_dl_results",
-                                use_container_width=True)
+                            export_csv_button(
+                                res, "gwas_results.csv",
+                                "dl_gwas", "Telecharger GWAS (CSV)")
 
+    # ============ TAB 5 : Selection ============
     with tabs[5]:
         st.subheader("Selection")
         step_header("5.2", "FST", "Selection.", "Signatures.",
@@ -2368,8 +2666,12 @@ def main():
         else:
             gt_use = (st.session_state.gt_pruned if has_pruned()
                       else st.session_state.gt_filt)
+            snp_fst = (st.session_state.snp_pruned if has_pruned()
+                       else st.session_state.snp_filt)
+
             sub1, sub2, sub3 = st.tabs(["FST/SNP", "FST pairwise",
                                         "Signatures"])
+
             with sub1:
                 threshold_q = st.slider("Quantile", 0.95, 0.9999,
                                         0.999, 0.0001, format="%.4f",
@@ -2383,34 +2685,30 @@ def main():
                         st.success("FST calcule.")
                     except Exception as e:
                         st.error("Erreur : " + str(e))
+
                 if st.session_state.fst is not None:
                     fst_c = st.session_state.fst[
                         np.isfinite(st.session_state.fst)]
                     if len(fst_c) > 0:
                         c1, c2, c3 = st.columns(3)
-                        c1.metric("FST moyen", str(round(fst_c.mean(), 4)))
+                        c1.metric("FST moyen",
+                                  str(round(fst_c.mean(), 4)))
                         c2.metric("FST median",
                                   str(round(np.median(fst_c), 4)))
                         c3.metric("Top outliers",
                                   str(round(np.quantile(fst_c,
                                                         threshold_q), 4)))
-                        snp_for_fst = (st.session_state.snp_pruned
-                                       if has_pruned()
-                                       else st.session_state.snp_filt)
-                        if len(st.session_state.fst) == len(snp_for_fst):
+
+                        if len(st.session_state.fst) == len(snp_fst):
                             fig = plot_manhattan(
                                 st.session_state.fst,
-                                snp_for_fst["CHR"].values,
+                                snp_fst["CHR"].values,
                                 threshold_q=threshold_q)
                             if fig:
-                                st.plotly_chart(
-                                    fig, use_container_width=True,
-                                    key="sel_plot_manhattan")
-                        else:
-                            st.error("Mismatch FST (" +
-                                     str(len(st.session_state.fst)) +
-                                     ") vs SNPs (" +
-                                     str(len(snp_for_fst)) + ")")
+                                st.plotly_chart(fig,
+                                                use_container_width=True,
+                                                key="sel_plot_manhattan")
+
                         fst_interp = interpret_fst(fst_c)
                         st.success("**" + str(fst_interp["verdict"]) +
                                    "** - " + str(fst_interp["explanation"]))
@@ -2442,8 +2740,7 @@ def main():
                     try:
                         with st.spinner("Analyse..."):
                             sel_df = selection_signatures(
-                                gt_use, st.session_state.snp_filt,
-                                _fid_array())
+                                gt_use, snp_fst, _fid_array())
                             st.session_state.selection_df = sel_df
                         st.success("Signatures detectees.")
                     except Exception as e:
@@ -2454,6 +2751,7 @@ def main():
                         st.session_state.selection_df.head(20),
                         use_container_width=True, key="sel_df_top20")
 
+    # ============ TAB 6 : Demographie ============
     with tabs[6]:
         st.subheader("Demographie")
         step_header("6.1, 6.5", "LD ROH Ne", "Demographie.",
@@ -2548,9 +2846,31 @@ def main():
                     st.plotly_chart(
                         plot_ne_curves(st.session_state.ne_dict),
                         use_container_width=True,
-                        key="demo_plot_ne_curves")
+                        key="demo_plot_ne_overlay")
+
+                    st.subheader("Tendance par race (facettes)")
+                    fig_f = plot_ne_facet(st.session_state.ne_dict)
+                    if fig_f:
+                        st.plotly_chart(fig_f,
+                                        use_container_width=True,
+                                        key="demo_plot_ne_facet")
+
                     st.warning("Interpretation RELATIVE uniquement.")
 
+                    ne_rows = []
+                    for race, df in st.session_state.ne_dict.items():
+                        if df is None or df.empty:
+                            continue
+                        d = df.copy()
+                        d["Race"] = race
+                        ne_rows.append(d)
+                    if ne_rows:
+                        export_csv_button(
+                            pd.concat(ne_rows, ignore_index=True),
+                            "ne_by_breed.csv", "dl_ne",
+                            "Telecharger Ne (CSV)")
+
+    # ============ TAB 7 : Admixture ============
     with tabs[7]:
         st.subheader("Admixture")
         step_header("6.4", "NMF", "Metissage.", "K optimal.",
@@ -2610,6 +2930,17 @@ def main():
                     .mean().round(3),
                     use_container_width=True)
 
+                Q_df = pd.DataFrame(Q,
+                                    columns=["K" + str(k + 1)
+                                             for k in range(K)])
+                Q_df.insert(0, "FID",
+                            st.session_state.ind_filt["FID"].values)
+                Q_df.insert(1, "IID",
+                            st.session_state.ind_filt["IID"].values)
+                export_csv_button(Q_df, "admixture_Q_K" + str(K) + ".csv",
+                                  "dl_admix", "Telecharger Admixture Q")
+
+    # ============ TAB 8 : Phylogenie ============
     with tabs[8]:
         st.subheader("Phylogenie")
         step_header("6.7", "Reynolds + NJ", "Distance.", "Relations.",
@@ -2626,20 +2957,34 @@ def main():
                         D, pops = reynolds_distance(gt_use, _fid_array())
                         st.session_state.reynolds_D = D
                         st.session_state.reynolds_pops = pops
-                    st.success("Matrice calculee.")
+                    st.success("Matrice calculee : " +
+                               str(D.shape[0]) + " races.")
                 except Exception as e:
                     st.error("Erreur : " + str(e))
 
             if st.session_state.reynolds_D is not None:
+                st.subheader("Matrice de distance (Reynolds)")
                 st.plotly_chart(
                     plot_reynolds(st.session_state.reynolds_D,
                                   st.session_state.reynolds_pops),
-                    use_container_width=True, key="phylo_plot_reynolds")
+                    use_container_width=True,
+                    key="phylo_plot_reynolds")
 
+                st.subheader("Arbre phylogenetique (NJ)")
+                fig_tree = plot_phylogenetic_tree(
+                    st.session_state.reynolds_D,
+                    st.session_state.reynolds_pops)
+                if fig_tree:
+                    st.plotly_chart(fig_tree,
+                                    use_container_width=True,
+                                    key="phylo_plot_tree")
+                else:
+                    st.warning("Impossible de dessiner l'arbre.")
+
+                st.subheader("Newick (SplitsTree4 / iTOL)")
                 newick = nj_tree_newick(
                     st.session_state.reynolds_D,
                     st.session_state.reynolds_pops)
-                st.subheader("Arbre NJ (Newick)")
                 st.code(newick, language="text")
                 st.download_button("Telecharger Newick",
                                    newick.encode("utf-8"),
@@ -2647,6 +2992,21 @@ def main():
                                    mime="text/plain",
                                    key="phylo_dl_newick")
 
+                st.divider()
+                st.subheader("Export matrice Reynolds")
+                pops = st.session_state.reynolds_pops
+                D = st.session_state.reynolds_D
+                rows = []
+                for i in range(len(pops)):
+                    for j in range(len(pops)):
+                        rows.append({"Pop1": pops[i], "Pop2": pops[j],
+                                     "Reynolds": D[i, j]})
+                df_reynolds = pd.DataFrame(rows)
+                export_csv_button(
+                    df_reynolds, "reynolds_matrix.csv",
+                    "dl_reynolds_tree", "Telecharger Reynolds (CSV)")
+
+    # ============ TAB 9 : Export ============
     with tabs[9]:
         st.subheader("Export PLINK / VCF")
         step_header("2.3", "Export", "PLINK.", "Format binaire.",
@@ -2665,7 +3025,8 @@ def main():
 
             with c1:
                 if st.button("Preparer PLINK ZIP",
-                             use_container_width=True, key="export_btn_plink"):
+                             use_container_width=True,
+                             key="export_btn_plink"):
                     try:
                         with st.spinner("Generation..."):
                             st.session_state["_plink_zip"] = (
@@ -2706,6 +3067,7 @@ def main():
                 st.metric("Individus", gt_use.shape[0])
                 st.metric("SNPs", gt_use.shape[1])
 
+    # ============ TAB 10 : Rapport PDF ============
     with tabs[10]:
         st.subheader("Rapport PDF")
         step_header("Synth", "PDF", "Compilation.", "Livrable.",
@@ -2713,7 +3075,8 @@ def main():
         if not has_qc():
             st.warning("Lancez au moins le QC.")
         else:
-            project_name = st.text_input("Nom du projet", "Cattle_Project",
+            project_name = st.text_input("Nom du projet",
+                                         "Cattle_Project",
                                          key="pdf_project_name")
             if st.button("Generer le rapport PDF", type="primary",
                          use_container_width=True, key="pdf_btn_gen"):
@@ -2741,7 +3104,8 @@ def main():
                                 missingness_per_snp(st.session_state.gt)))
                             figs_qc.append(plot_hist(
                                 maf(st.session_state.gt),
-                                "Spectre MAF", "MAF", "#2ecc71"))
+                                "Spectre MAF", "MAF", "#8FBC8F",
+                                xlim=(0, 0.5), breaks=50))
                         except Exception:
                             pass
                         sections.append({
@@ -2781,20 +3145,11 @@ def main():
                                                   3)),
                                 "figures": figs_gwas})
 
-                        if st.session_state.fst is not None:
-                            fig_fst = plot_manhattan(
-                                st.session_state.fst,
-                                st.session_state.snp_filt["CHR"].values)
-                            sections.append({
-                                "title": "4. FST",
-                                "text": "Manhattan FST",
-                                "figures": [fig_fst]})
-
                         if st.session_state.froh is not None:
                             fig_roh = plot_roh_histogram(
                                 st.session_state.froh, _fid_array())
                             sections.append({
-                                "title": "5. ROH",
+                                "title": "4. ROH",
                                 "text": "FROH",
                                 "figures": [fig_roh]})
 
