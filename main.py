@@ -1084,24 +1084,58 @@ def load_phenotypes_file(file_bytes, filename=""):
 
 def match_phenotypes(ind_df, pheno_df, iid_col=None):
     if iid_col is None:
-        for c in ["IID", "id", "ID", "sample", "Sample", "animal",
-                  "Animal"]:
+        for c in ["Animal", "IID", "id", "ID", "sample", "Sample",
+                  "animal", "AnimalID", "animal_id"]:
             if c in pheno_df.columns:
                 iid_col = c
                 break
     if iid_col is None:
-        raise ValueError("Aucune colonne IID trouvee. Dispo : " +
+        raise ValueError("Aucune colonne IID/Animal trouvee. Dispo : " +
                          str(list(pheno_df.columns)))
 
     p = pheno_df.copy()
-    p[iid_col] = p[iid_col].astype(str)
     ind = ind_df.copy()
-    ind["_key"] = ind["IID"].astype(str)
-    p["_key"] = p[iid_col]
+
+    # Normalisation de base
+    p["_key_raw"] = p[iid_col].astype(str).str.strip()
+    ind["_key_raw"] = ind["IID"].astype(str).str.strip()
+
+    # Essai 1 : correspondance stricte
+    common = set(p["_key_raw"]) & set(ind["_key_raw"])
+    if len(common) >= 10:
+        p["_key"] = p["_key_raw"]
+        ind["_key"] = ind["_key_raw"]
+        st.info("Matching strict : " + str(len(common)) +
+                " individus matches.")
+    else:
+        # Essai 2 : extraire les NUMEROS des IID et comparer
+        def extract_number(s):
+            import re
+            s = str(s)
+            # Trouve tous les nombres dans la chaine
+            nums = re.findall(r"\d+", s)
+            if nums:
+                # Prend le plus long (souvent le numero animal)
+                return max(nums, key=len)
+            return s
+
+        p["_key"] = p["_key_raw"].apply(extract_number)
+        ind["_key"] = ind["_key_raw"].apply(extract_number)
+
+        common2 = set(p["_key"]) & set(ind["_key"])
+        st.info("Matching par numero : " + str(len(common2)) +
+                " individus matches.")
+        st.caption("Exemple genotype : " +
+                   str(ind["_key_raw"].iloc[0]) +
+                   " -> cle " + str(ind["_key"].iloc[0]))
+        st.caption("Exemple phenotype : " +
+                   str(p["_key_raw"].iloc[0]) +
+                   " -> cle " + str(p["_key"].iloc[0]))
 
     merged = ind[["_key", "FID", "IID"]].merge(
-        p.drop(columns=[iid_col]), on="_key", how="left")
-    merged = merged.drop(columns="_key")
+        p.drop(columns=[iid_col, "_key_raw"]),
+        on="_key", how="left", suffixes=("", "_pheno"))
+    merged = merged.drop(columns=["_key"])
     return merged, iid_col
 
 
