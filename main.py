@@ -2434,7 +2434,7 @@ def main():
 
             st.divider()
             st.subheader("Export Structure")
-                        if st.session_state.pca_scores is not None:
+            if st.session_state.pca_scores is not None:
                 n_pc = min(10, st.session_state.pca_scores.shape[1])
                 pca_df = pd.DataFrame(
                     st.session_state.pca_scores[:, :n_pc],
