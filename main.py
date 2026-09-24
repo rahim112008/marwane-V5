@@ -2383,32 +2383,34 @@ def main():
                         st.success("FST calcule.")
                     except Exception as e:
                         st.error("Erreur : " + str(e))
-                if st.session_state.fst is not None:
+                                if st.session_state.fst is not None:
                     fst_c = st.session_state.fst[
                         np.isfinite(st.session_state.fst)]
                     if len(fst_c) > 0:
                         c1, c2, c3 = st.columns(3)
-                        c1.metric("FST moyen",
-                                  str(round(fst_c.mean(), 4)))
+                        c1.metric("FST moyen", str(round(fst_c.mean(), 4)))
                         c2.metric("FST median",
                                   str(round(np.median(fst_c), 4)))
                         c3.metric("Top outliers",
                                   str(round(np.quantile(fst_c,
                                                         threshold_q), 4)))
-                        snp_for_fst = (st.session_state.snp_pruned if has_pruned()
-               else st.session_state.snp_filt)
-if len(st.session_state.fst) != len(snp_for_fst):
-    st.error("Mismatch FST (" + str(len(st.session_state.fst)) +
-             ") vs SNPs (" + str(len(snp_for_fst)) +
-             "). Relance FST par SNP.")
-else:
-    fig = plot_manhattan(
-        st.session_state.fst,
-        snp_for_fst["CHR"].values,
-        threshold_q=threshold_q)
-                            st.plotly_chart(fig,
-                                            use_container_width=True,
-                                            key="sel_plot_manhattan")
+                        snp_for_fst = (st.session_state.snp_pruned
+                                       if has_pruned()
+                                       else st.session_state.snp_filt)
+                        if len(st.session_state.fst) == len(snp_for_fst):
+                            fig = plot_manhattan(
+                                st.session_state.fst,
+                                snp_for_fst["CHR"].values,
+                                threshold_q=threshold_q)
+                            if fig:
+                                st.plotly_chart(
+                                    fig, use_container_width=True,
+                                    key="sel_plot_manhattan")
+                        else:
+                            st.error("Mismatch FST (" +
+                                     str(len(st.session_state.fst)) +
+                                     ") vs SNPs (" +
+                                     str(len(snp_for_fst)) + ")")
                         fst_interp = interpret_fst(fst_c)
                         st.success("**" + str(fst_interp["verdict"]) +
                                    "** - " + str(fst_interp["explanation"]))
