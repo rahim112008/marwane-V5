@@ -2344,47 +2344,86 @@ def build_report_html(config, stats, figures=None, interpretations=None):
         first = False
         blocks.append(f"<h2>{title}</h2>{html}")
 
-    interp_html = ""
-    for module, interp in interpretations.items():
-        interp_html += f"""
-        <div style="background:#eafaf1;padding:12px;
-                    border-radius:8px;margin:10px 0;">
-          <h3>{module}</h3>
-          <p><b>{interp.get('verdict','')}</b> —
-             {interp.get('explanation','')}</p>
-          <p><b>Métriques :</b> {interp.get('metrics', {})}</p>
-          <p><b>Recommandation :</b> {interp.get('recommendation','')}</p>
-        </div>"""
+    def build_report_html(config, stats, figures=None, interpretations=None):
+    # Construit un rapport HTML (fallback si PDF indisponible).
+    figures = figures or {}
+    interpretations = interpretations or {}
 
-    return f"""<!DOCTYPE html>
-<html lang="fr"><head><meta charset="UTF-8">
-<title>Rapport Bovine SNP Platform</title>
-<style>
- body {{ font-family: 'Segoe UI', Arial, sans-serif;
-         margin: 30px; color: #222; }}
- h1 {{ color: #1a5276; border-bottom: 3px solid #1a5276;
-       padding-bottom: 8px; }}
- h2 {{ color: #2471a3; margin-top: 28px; }}
- .summary {{ background: #f4f6f7; padding: 16px;
-             border-radius: 8px; }}
-</style></head><body>
-<h1>🐄 Rapport Bovine SNP Platform</h1>
-<p><b>Projet :</b> {config.get('project_name','N/A')} —
-   <b>Date :</b> {datetime.now():%Y-%m-%d %H:%M}</p>
-<div class="summary"><h2>Résumé exécutif</h2><ul>
- <li>Individus analysés : <b>{stats['n_ind_final']}</b>
-     (sur {stats['n_ind_init']})</li>
- <li>SNPs retenus : <b>{stats['n_snp_final']}</b>
-     (sur {stats['n_snp_init']})</li>
- <li>Individus exclus : <b>{stats['excluded_ind']}</b></li>
- <li>SNPs exclus : <b>{stats['excluded_snp']}</b></li>
-</ul></div>
-{interp_html}
-{''.join(blocks)}
-<hr><p style="font-size:0.85em;color:#666">
-Rapport généré par Bovine SNP Platform v5.0.</p>
-</body></html>
-"""
+    # --- Figures Plotly ---
+    first = True
+    blocks = []
+    for title, fig in figures.items():
+        if fig is None:
+            continue
+        html = fig.to_html(full_html=False,
+                           include_plotlyjs="cdn" if first else False)
+        first = False
+        blocks.append("<h2>" + str(title) + "</h2>" + html)
+
+    # --- Interpretations IA ---
+    interp_parts = []
+    for module, interp in interpretations.items():
+        v = interp.get("verdict", "")
+        e = interp.get("explanation", "")
+        m = interp.get("metrics", {})
+        r = interp.get("recommendation", "")
+        block = (
+            '<div style="background:#eafaf1;padding:12px;'
+            'border-radius:8px;margin:10px 0;">'
+            "<h3>" + str(module) + "</h3>"
+            "<p><b>" + str(v) + "</b> - " + str(e) + "</p>"
+            "<p><b>Metriques :</b> " + str(m) + "</p>"
+            "<p><b>Recommandation :</b> " + str(r) + "</p>"
+            "</div>"
+        )
+        interp_parts.append(block)
+    interp_html = "".join(interp_parts)
+
+    # --- En-tete + CSS ---
+    project_name = config.get("project_name", "N/A")
+    date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    css = (
+        "body { font-family: Arial, sans-serif; margin: 30px; "
+        "color: #222; } "
+        "h1 { color: #1a5276; border-bottom: 3px solid #1a5276; "
+        "padding-bottom: 8px; } "
+        "h2 { color: #2471a3; margin-top: 28px; } "
+        ".summary { background: #f4f6f7; padding: 16px; "
+        "border-radius: 8px; }"
+    )
+
+    n_ind_final = stats.get("n_ind_final", 0)
+    n_ind_init = stats.get("n_ind_init", 0)
+    n_snp_final = stats.get("n_snp_final", 0)
+    n_snp_init = stats.get("n_snp_init", 0)
+    excluded_ind = stats.get("excluded_ind", 0)
+    excluded_snp = stats.get("excluded_snp", 0)
+
+    html = (
+        "<!DOCTYPE html>"
+        '<html lang="fr"><head><meta charset="UTF-8">'
+        "<title>Rapport Bovine SNP Platform</title>"
+        "<style>" + css + "</style></head><body>"
+        "<h1>Bovine SNP Platform - Rapport d'analyse</h1>"
+        "<p><b>Projet :</b> " + str(project_name) + " - "
+        "<b>Date :</b> " + date_str + "</p>"
+        '<div class="summary"><h2>Resume executif</h2><ul>'
+        "<li>Individus analyses : <b>" + str(n_ind_final) + "</b> "
+        "(sur " + str(n_ind_init) + ")</li>"
+        "<li>SNPs retenus : <b>" + str(n_snp_final) + "</b> "
+        "(sur " + str(n_snp_init) + ")</li>"
+        "<li>Individus exclus : <b>" + str(excluded_ind) + "</b></li>"
+        "<li>SNPs exclus : <b>" + str(excluded_snp) + "</b></li>"
+        "</ul></div>"
+        + interp_html
+        + "".join(blocks)
+        + "<hr>"
+        '<p style="font-size:0.85em;color:#666">'
+        "Rapport genere par Bovine SNP Platform v5.0.</p>"
+        "</body></html>"
+    )
+    return html
 
 
 # ============================================================
