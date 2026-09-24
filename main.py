@@ -2395,11 +2395,17 @@ def main():
                         c3.metric("Top outliers",
                                   str(round(np.quantile(fst_c,
                                                         threshold_q), 4)))
-                        fig = plot_manhattan(
-                            st.session_state.fst,
-                            st.session_state.snp_filt["CHR"].values,
-                            threshold_q=threshold_q)
-                        if fig:
+                        snp_for_fst = (st.session_state.snp_pruned if has_pruned()
+               else st.session_state.snp_filt)
+if len(st.session_state.fst) != len(snp_for_fst):
+    st.error("Mismatch FST (" + str(len(st.session_state.fst)) +
+             ") vs SNPs (" + str(len(snp_for_fst)) +
+             "). Relance FST par SNP.")
+else:
+    fig = plot_manhattan(
+        st.session_state.fst,
+        snp_for_fst["CHR"].values,
+        threshold_q=threshold_q)
                             st.plotly_chart(fig,
                                             use_container_width=True,
                                             key="sel_plot_manhattan")
