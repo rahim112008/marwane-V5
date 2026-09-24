@@ -2383,7 +2383,7 @@ def main():
                         st.success("FST calcule.")
                     except Exception as e:
                         st.error("Erreur : " + str(e))
-                                if st.session_state.fst is not None:
+                if st.session_state.fst is not None:
                     fst_c = st.session_state.fst[
                         np.isfinite(st.session_state.fst)]
                     if len(fst_c) > 0:
