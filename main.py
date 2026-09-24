@@ -1,8 +1,9 @@
 """
-Bovine SNP Platform v5.0 - Etape 2
-Chargement donnees + QC + LD Pruning + Structure (PCA/MDS)
+Bovine SNP Platform v5.0 - Etape 3
+Chargement + QC + LD Pruning + Structure + GWAS
 """
 import gzip
+import io
 from collections import Counter
 
 import numpy as np
@@ -12,6 +13,8 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 from scipy import stats
+from scipy.optimize import minimize_scalar
+from scipy.stats import t as t_dist
 from sklearn.decomposition import PCA
 from sklearn.manifold import MDS as SklearnMDS
 
@@ -547,6 +550,237 @@ def mds_analysis(gt, n_components=5):
                       normalized_stress=False).fit_transform(D)
 
 
+@cache_data
+def king_kinship(gt):
+    n_ind = gt.shape[0]
+    het = np.nansum(gt == 1, axis=1).astype(np.float64)
+    K = np.zeros((n_ind, n_ind))
+    for i in range(n_ind):
+        for j in range(i + 1, n_ind):
+            both_het = np.nansum((gt[i] == 1) & (gt[j] == 1))
+            denom = het[i] + het[j]
+            phi = (denom - 2 * both_het) / denom if denom > 0 else 0.0
+            K[i, j] = K[j, i] = phi
+    np.fill_diagonal(K, 0.5)
+    return K
+
+
+def load_phenotypes_file(file_bytes, filename=""):
+    if filename.endswith(".gz"):
+        try:
+            raw = gzip.decompress(file_bytes)
+        except Exception:
+            raw = file_bytes
+    else:
+        raw = file_bytes
+    text = raw.decode("utf-8", errors="replace")
+    first_line = text.splitlines()[0] if text else ""
+    sep = "\t" if first_line.count("\t") > first_line.count(",") else ","
+    df = pd.read_csv(io.StringIO(text), sep=sep, engine="python")
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
+def match_phenotypes(ind_df, pheno_df, iid_col=None):
+    if iid_col is None:
+        for c in ["IID", "id", "ID", "sample", "Sample", "animal",
+                  "Animal"]:
+            if c in pheno_df.columns:
+                iid_col = c
+                break
+    if iid_col is None:
+        raise ValueError("Aucune colonne IID trouvee. Colonnes dispo : " +
+                         str(list(pheno_df.columns)))
+
+    p = pheno_df.copy()
+    p[iid_col] = p[iid_col].astype(str)
+    ind = ind_df.copy()
+    ind["_key"] = ind["IID"].astype(str)
+    p["_key"] = p[iid_col]
+
+    merged = ind[["_key", "FID", "IID"]].merge(
+        p.drop(columns=[iid_col]), on="_key", how="left")
+    merged = merged.drop(columns="_key")
+    return merged, iid_col
+
+
+def _vc_estimate_delta(Y, X0, K):
+    n = len(Y)
+    d, U = np.linalg.eigh(K)
+    d = np.maximum(d, 0)
+    Yt = U.T @ Y
+    X0t = U.T @ X0
+
+    def neg_loglik(delta):
+        if delta <= 0:
+            return 1e18
+        w = 1.0 / np.sqrt(delta * d + 1.0)
+        Yw = Yt * w
+        Xw = X0t * w[:, None]
+        try:
+            beta, *_ = np.linalg.lstsq(Xw, Yw, rcond=None)
+        except np.linalg.LinAlgError:
+            return 1e18
+        resid = Yw - Xw @ beta
+        s2 = float(np.sum(resid ** 2) / n)
+        if s2 <= 0:
+            return 1e18
+        return -(-0.5 * (n * np.log(s2) +
+                         np.sum(np.log(delta * d + 1.0))))
+
+    grid = np.logspace(-3, 3, 30)
+    lls = np.array([neg_loglik(dl) for dl in grid])
+    i_best = int(np.argmin(lls))
+    lo = grid[max(0, i_best - 1)]
+    hi = grid[min(len(grid) - 1, i_best + 1)]
+    try:
+        res = minimize_scalar(neg_loglik, bounds=(lo, hi),
+                              method="bounded",
+                              options={"xatol": 1e-4})
+        delta_opt = float(res.x)
+    except Exception:
+        delta_opt = float(grid[i_best])
+    return max(delta_opt, 1e-6)
+
+
+@cache_data
+def run_gwas_lmm(gt, pheno_vec, K, covariates,
+                 maf_min=0.05, missing_max=0.05, use_lmm=True):
+    n_all, n_snp = gt.shape
+    pheno_vec = np.asarray(pheno_vec, dtype=float)
+
+    valid_ind = np.isfinite(pheno_vec)
+    if valid_ind.sum() < 10:
+        raise ValueError("Moins de 10 individus avec phenotype valide.")
+
+    Y = pheno_vec[valid_ind]
+    gt_v = gt[valid_ind]
+    K_v = np.asarray(K)[np.ix_(valid_ind, valid_ind)]
+
+    if covariates is None or covariates.size == 0:
+        X0 = np.ones((len(Y), 1))
+    else:
+        cov = np.asarray(covariates)[valid_ind]
+        X0 = np.column_stack([np.ones(len(Y)), cov])
+
+    keep_cols = np.ones(X0.shape[1], dtype=bool)
+    for j in range(1, X0.shape[1]):
+        if X0[:, j].std() < 1e-10:
+            keep_cols[j] = False
+    X0 = X0[:, keep_cols]
+
+    n = len(Y)
+
+    if use_lmm:
+        delta = _vc_estimate_delta(Y, X0, K_v)
+        d, U = np.linalg.eigh(K_v)
+        d = np.maximum(d, 0)
+        w = 1.0 / np.sqrt(delta * d + 1.0)
+        Yt = (U.T @ Y) * w
+        X0t = (U.T @ X0) * w[:, None]
+    else:
+        Yt = Y
+        X0t = X0
+
+    out = {"SNP_idx": [], "MAF": [], "BETA": [], "SE": [],
+           "T": [], "P": []}
+
+    for j in range(n_snp):
+        g = gt_v[:, j].astype(float)
+        nan_mask = ~np.isfinite(g)
+        miss_j = nan_mask.mean()
+        if miss_j > missing_max:
+            continue
+
+        if nan_mask.any():
+            m_g = np.nanmean(g)
+            if not np.isfinite(m_g):
+                continue
+            g = np.where(nan_mask, m_g, g)
+
+        p = g.mean() / 2.0
+        maf_j = min(p, 1.0 - p)
+        if maf_j < maf_min:
+            continue
+
+        if use_lmm:
+            gw = (U.T @ g) * w
+            X = np.column_stack([X0t, gw])
+        else:
+            X = np.column_stack([X0t, g])
+
+        try:
+            beta, *_ = np.linalg.lstsq(X, Yt, rcond=None)
+        except np.linalg.LinAlgError:
+            continue
+
+        resid = Yt - X @ beta
+        dof = max(n - X.shape[1], 1)
+        s2 = float(np.sum(resid ** 2) / dof)
+        if s2 <= 0:
+            continue
+
+        try:
+            XtX_inv = np.linalg.inv(X.T @ X)
+        except np.linalg.LinAlgError:
+            continue
+        se = float(np.sqrt(s2 * XtX_inv[-1, -1]))
+        if se <= 0 or not np.isfinite(se):
+            continue
+
+        t_val = beta[-1] / se
+        p_val = float(2 * t_dist.sf(abs(t_val), df=dof))
+
+        out["SNP_idx"].append(j)
+        out["MAF"].append(float(maf_j))
+        out["BETA"].append(float(beta[-1]))
+        out["SE"].append(se)
+        out["T"].append(float(t_val))
+        out["P"].append(p_val)
+
+    if not out["SNP_idx"]:
+        return pd.DataFrame(
+            columns=["SNP_idx", "MAF", "BETA", "SE", "T", "P"])
+
+    return pd.DataFrame(out)
+
+
+def annotate_gwas_results(res_df, snp_df):
+    if res_df.empty:
+        return res_df
+    idx = res_df["SNP_idx"].astype(int).values
+    res_df = res_df.copy()
+    res_df["SNP"] = snp_df["SNP"].astype(str).values[idx]
+    res_df["CHR"] = snp_df["CHR"].astype(str).values[idx]
+    res_df["BP"] = snp_df["BP"].astype(int).values[idx]
+    return res_df[["SNP_idx", "SNP", "CHR", "BP", "MAF",
+                   "BETA", "SE", "T", "P"]]
+
+
+def compute_lambda_gc(pvals):
+    p = np.asarray(pvals)
+    p = p[np.isfinite(p) & (p > 0) & (p <= 1)]
+    if len(p) < 10:
+        return np.nan
+    chi2_obs = stats.chi2.isf(p, df=1)
+    return float(np.median(chi2_obs) / stats.chi2.ppf(0.5, df=1))
+
+
+def gwas_thresholds(pvals, alpha=0.05):
+    p = np.asarray(pvals)
+    p = p[np.isfinite(p)]
+    n = len(p)
+    if n == 0:
+        return {"bonferroni": np.nan, "fdr_05": np.nan, "n_tests": 0}
+    bonf = alpha / n
+    ps = np.sort(p)
+    bh = ps * n / np.arange(1, n + 1)
+    bh = np.minimum.accumulate(bh[::-1])[::-1]
+    sig_idx = np.where(bh <= alpha)[0]
+    fdr_thr = float(ps[sig_idx[-1]]) if len(sig_idx) else np.nan
+    return {"bonferroni": float(bonf), "fdr_05": fdr_thr, "n_tests": int(n)}
+
+
 def plot_hist(values, title, xlabel, color="#3498db"):
     fig = go.Figure()
     fig.add_trace(go.Histogram(x=values, nbinsx=80, marker_color=color))
@@ -566,9 +800,6 @@ def plot_missingness_dashboard(miss_ind, miss_snp):
                                marker_color="coral"), row=1, col=2)
     fig.update_layout(height=400, showlegend=False,
                       margin=dict(l=40, r=20, t=60, b=40))
-    fig.update_xaxes(title_text="Frequence manquante", row=1, col=1)
-    fig.update_xaxes(title_text="Frequence manquante", row=1, col=2)
-    fig.update_yaxes(title_text="Nombre", row=1, col=1)
     return fig
 
 
@@ -608,6 +839,122 @@ def plot_mds(coords, labels):
     return fig
 
 
+def plot_gwas_manhattan(res_df, bonferroni=None, fdr=None,
+                        title="GWAS Manhattan"):
+    df = res_df.copy()
+    df = df[np.isfinite(df["P"])].reset_index(drop=True)
+    if df.empty:
+        return None
+    df["-log10P"] = -np.log10(np.clip(df["P"], 1e-300, 1))
+
+    order = df["CHR"].map(_chr_sort_key)
+    df["_k0"] = order.map(lambda t: t[0])
+    df["_k1"] = order.map(lambda t: t[1])
+    df["_k2"] = order.map(lambda t: t[2])
+    df = df.sort_values(["_k0", "_k1", "BP"]).reset_index(drop=True)
+
+    cum, ticks, labels = 0, [], []
+    pos = np.zeros(len(df), dtype=int)
+    for chrom in df["CHR"].unique():
+        idx = np.where(df["CHR"] == chrom)[0]
+        pos[idx] = np.arange(cum, cum + len(idx))
+        ticks.append((cum + cum + len(idx) - 1) / 2)
+        labels.append(str(chrom))
+        cum += len(idx)
+    df["x"] = pos
+
+    fig = go.Figure()
+    for i, chrom in enumerate(df["CHR"].unique()):
+        sub = df[df["CHR"] == chrom]
+        color = "#2c3e50" if i % 2 == 0 else "#7f8c8d"
+        fig.add_trace(go.Scatter(
+            x=sub["x"], y=sub["-log10P"], mode="markers",
+            marker=dict(size=5, color=color),
+            text=[s + " CHR" + str(c) + ":" + str(b) +
+                  " P=" + str(round(p, 6)) + " beta=" + str(round(bb, 3))
+                  for s, c, b, p, bb in zip(sub["SNP"], sub["CHR"],
+                                            sub["BP"], sub["P"],
+                                            sub["BETA"])],
+            hoverinfo="text", showlegend=False))
+
+    if bonferroni is not None and np.isfinite(bonferroni):
+        fig.add_hline(y=-np.log10(bonferroni), line_dash="dash",
+                      line_color="red",
+                      annotation_text="Bonferroni",
+                      annotation_position="top right")
+    if fdr is not None and np.isfinite(fdr):
+        fig.add_hline(y=-np.log10(fdr), line_dash="dot",
+                      line_color="orange",
+                      annotation_text="FDR 5 pct",
+                      annotation_position="bottom right")
+
+    fig.update_layout(title=title, xaxis_title="Chromosome",
+                      yaxis_title="-log10(P)", height=520,
+                      margin=dict(l=40, r=20, t=60, b=40))
+    fig.update_xaxes(tickvals=ticks, ticktext=labels)
+    return fig
+
+
+def plot_gwas_qq(pvals, lambda_gc=None):
+    p = np.asarray(pvals)
+    p = p[np.isfinite(p) & (p > 0) & (p <= 1)]
+    if len(p) < 10:
+        return None
+    p = np.sort(p)
+    n = len(p)
+    expected = (np.arange(1, n + 1) - 0.5) / n
+    obs = -np.log10(p)
+    exp = -np.log10(expected)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=exp, y=obs, mode="markers",
+                             marker=dict(size=5, color="#2c3e50"),
+                             name="Observe"))
+    lim = max(exp.max(), obs.max()) * 1.05
+    fig.add_trace(go.Scatter(x=[0, lim], y=[0, lim], mode="lines",
+                             line=dict(color="red", dash="dash"),
+                             name="Attendu (H0)"))
+    sub = ("lambdaGC = " + str(round(lambda_gc, 3))
+           if lambda_gc is not None and np.isfinite(lambda_gc) else "")
+    fig.update_layout(title="QQ plot " + sub,
+                      xaxis_title="Attendu -log10(P)",
+                      yaxis_title="Observe -log10(P)",
+                      height=520,
+                      margin=dict(l=40, r=20, t=60, b=40))
+    return fig
+
+
+def plot_locuszoom(res_df, snp_df, chrom, center_bp, window_kb=500):
+    chrom = str(chrom)
+    window_bp = window_kb * 1000
+    df = res_df.copy()
+    df = df[df["CHR"].astype(str) == chrom]
+    df = df[(df["BP"] >= center_bp - window_bp) &
+            (df["BP"] <= center_bp + window_bp)]
+    if df.empty:
+        return None
+    df["-log10P"] = -np.log10(np.clip(df["P"], 1e-300, 1))
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df["BP"] / 1e6, y=df["-log10P"], mode="markers",
+        marker=dict(size=8, color=df["-log10P"],
+                    colorscale="Viridis",
+                    showscale=True, colorbar=dict(title="-log10P")),
+        text=[s + " P=" + str(round(p, 6)) + " beta=" + str(round(b, 3))
+              for s, p, b in zip(df["SNP"], df["P"], df["BETA"])],
+        hoverinfo="text"))
+    fig.add_vline(x=center_bp / 1e6, line_dash="dash", line_color="red",
+                  annotation_text="Lead SNP",
+                  annotation_position="top")
+    fig.update_layout(
+        title="LocusZoom - CHR " + chrom + " : " +
+              str(round(center_bp / 1e6, 2)) + " Mb +/- " +
+              str(window_kb) + " kb",
+        xaxis_title="Position (Mb)",
+        yaxis_title="-log10(P)", height=500)
+    return fig
+
+
 def interpret_qc(qc_stats):
     pct_ind = (qc_stats["excluded_ind"] /
                max(qc_stats["n_ind_init"], 1) * 100)
@@ -644,10 +991,27 @@ def interpret_maf(maf_values):
                               str(round(pct, 1)) + " pct des SNPs."}
 
 
+def interpret_fst(fst_values):
+    m = float(np.nanmean(np.asarray(fst_values)))
+    if m < 0.05:
+        v, e = "Faible", "Fort flux genique."
+    elif m < 0.15:
+        v, e = "MODEREE", "Races distinctes."
+    elif m < 0.25:
+        v, e = "FORTE", "Races isolees genetiquement."
+    else:
+        v, e = "TRES FORTE", "Quasi-especes distinctes."
+    return {"verdict": v, "explanation": e,
+            "metrics": {"FST_moyen": round(m, 4)},
+            "recommendation": "Utiliser PC1-PC10 comme covariables."}
+
+
 _STATE_KEYS = ["gt", "ind_df", "snp_df",
                "gt_filt", "ind_filt", "snp_filt", "qc_stats",
                "gt_pruned", "snp_pruned", "ld_df",
-               "pca_scores", "pca_var", "mds_coords"]
+               "pca_scores", "pca_var", "mds_coords", "king_matrix",
+               "pheno_matched", "gwas_results",
+               "gwas_pheno_name", "gwas_lambda"]
 
 
 def init_state():
@@ -679,7 +1043,7 @@ def _fid_array():
 def main():
     init_state()
     st.title("Bovine SNP Platform v5.0")
-    st.caption("Etape 2 : QC + LD Pruning + Structure (PCA/MDS)")
+    st.caption("Etape 3 : QC + LD Pruning + Structure + GWAS")
 
     with st.sidebar:
         st.header("Donnees")
@@ -703,14 +1067,8 @@ def main():
                     st.session_state.gt = gt
                     st.session_state.ind_df = ind_df
                     st.session_state.snp_df = snp_df
-                    st.session_state.gt_filt = None
-                    st.session_state.ind_filt = None
-                    st.session_state.snp_filt = None
-                    st.session_state.qc_stats = None
-                    st.session_state.gt_pruned = None
-                    st.session_state.snp_pruned = None
-                    st.session_state.pca_scores = None
-                    st.session_state.mds_coords = None
+                    for k in _STATE_KEYS[3:]:
+                        st.session_state[k] = None
                 st.success(str(gt.shape[0]) + " ind x " +
                            str(gt.shape[1]) + " SNPs")
 
@@ -726,9 +1084,8 @@ def main():
                 if st.button("Charger PED + MAP",
                              use_container_width=True, key="sb_btn_ped"):
                     try:
-                        with st.spinner("Parsing .map..."):
+                        with st.spinner("Parsing..."):
                             map_df, _ = parse_map(map_f.read())
-                        with st.spinner("Parsing .ped..."):
                             gt, ind_df, _ = parse_ped(ped_f.read(),
                                                       len(map_df))
                         if len(map_df) != gt.shape[1]:
@@ -738,14 +1095,8 @@ def main():
                         st.session_state.gt = gt
                         st.session_state.ind_df = ind_df
                         st.session_state.snp_df = map_df
-                        st.session_state.gt_filt = None
-                        st.session_state.ind_filt = None
-                        st.session_state.snp_filt = None
-                        st.session_state.qc_stats = None
-                        st.session_state.gt_pruned = None
-                        st.session_state.snp_pruned = None
-                        st.session_state.pca_scores = None
-                        st.session_state.mds_coords = None
+                        for k in _STATE_KEYS[3:]:
+                            st.session_state[k] = None
                         st.success(str(gt.shape[0]) + " ind x " +
                                    str(gt.shape[1]) + " SNPs")
                     except Exception as e:
@@ -762,11 +1113,11 @@ def main():
         hwe_thr = st.number_input("HWE p-value",
                                   value=DEFAULT_THRESHOLDS["hwe"],
                                   format="%.0e", key="sb_hwe")
-        het_sd = st.slider("Heterozygotie sigma intra-race", 1.0, 5.0,
+        het_sd = st.slider("Heterozygotie sigma", 1.0, 5.0,
                            DEFAULT_THRESHOLDS["het_sd"], 0.1,
                            key="sb_het_sd")
         st.divider()
-        ld_r2 = st.slider("LD Pruning r2 seuil", 0.05, 0.5,
+        ld_r2 = st.slider("LD Pruning r2", 0.05, 0.5,
                           DEFAULT_THRESHOLDS["ld_r2"], 0.05,
                           key="sb_ld_r2")
 
@@ -778,7 +1129,7 @@ def main():
     ind_df = st.session_state.ind_df
     snp_df = st.session_state.snp_df
 
-    tabs = st.tabs(["Apercu", "QC", "LD Pruning", "Structure"])
+    tabs = st.tabs(["Apercu", "QC", "LD Pruning", "Structure", "GWAS"])
 
     with tabs[0]:
         step_header("0", "Apercu des donnees",
@@ -825,10 +1176,9 @@ def main():
                     st.session_state.ind_filt = ind_f
                     st.session_state.snp_filt = snp_f
                     st.session_state.qc_stats = qc_stats
-                    st.session_state.gt_pruned = None
-                    st.session_state.snp_pruned = None
-                    st.session_state.pca_scores = None
-                    st.session_state.mds_coords = None
+                    for k in ["gt_pruned", "snp_pruned", "pca_scores",
+                              "mds_coords", "king_matrix", "gwas_results"]:
+                        st.session_state[k] = None
                 st.success("QC termine.")
             except Exception as e:
                 st.error("Erreur : " + str(e))
@@ -874,20 +1224,11 @@ def main():
             st.json(qc_interp["metrics"])
             st.info(qc_interp["recommendation"])
 
-            st.divider()
-            st.subheader("Interpretation IA MAF")
-            maf_interp = interpret_maf(maf(gt_full))
-            st.success("**" + str(maf_interp["verdict"]) + "** - " +
-                       str(maf_interp["explanation"]))
-            st.json(maf_interp["metrics"])
-            st.info(maf_interp["recommendation"])
-
     with tabs[2]:
         st.subheader("LD Pruning")
         step_header("4.5", "Elagage par desequilibre de liaison",
-                    "Retire les SNPs correles (r2 > seuil) dans fenetre de "
-                    "50 SNPs.",
-                    "PCA et ADMIXTURE supposent marqueurs independants.",
+                    "Retire les SNPs correles (r2 > seuil) fenetre 50.",
+                    "PCA et GWAS supposent marqueurs independants.",
                     "Sous-ensemble quasi-independant.")
 
         if not has_qc():
@@ -932,10 +1273,10 @@ def main():
 
     with tabs[3]:
         st.subheader("Structure des populations")
-        step_header("5.3-5.4", "PCA et MDS",
-                    "PCA et MDS sur les SNPs independants.",
-                    "Visualiser la structure genetique.",
-                    "Nuages 2D des individus.")
+        step_header("5.3-5.4", "PCA, MDS, KING",
+                    "PCA, MDS (IBS), matrice KING.",
+                    "Visualiser structure + calculer parente pour GWAS.",
+                    "Nuages 2D + matrice de parente.")
 
         if not has_qc():
             st.warning("Lancez d'abord le QC.")
@@ -943,7 +1284,7 @@ def main():
             gt_use = (st.session_state.gt_pruned if has_pruned()
                       else st.session_state.gt_filt)
 
-            if st.button("Lancer PCA + MDS", type="primary",
+            if st.button("Lancer PCA + MDS + KING", type="primary",
                          key="struct_btn_run"):
                 try:
                     with st.spinner("PCA..."):
@@ -952,6 +1293,8 @@ def main():
                         st.session_state.pca_var = v_
                     with st.spinner("MDS..."):
                         st.session_state.mds_coords = mds_analysis(gt_use, 5)
+                    with st.spinner("KING..."):
+                        st.session_state.king_matrix = king_kinship(gt_use)
                     st.success("Termine.")
                 except Exception as e:
                     st.error("Erreur : " + str(e))
@@ -963,17 +1306,200 @@ def main():
                              st.session_state.pca_var, labels),
                     use_container_width=True, key="struct_plot_pca")
 
-                var_tab = pd.DataFrame({
-                    "PC": ["PC" + str(i + 1) for i in range(10)],
-                    "Variance_pct": np.round(
-                        st.session_state.pca_var[:10], 3)})
-                st.dataframe(var_tab, use_container_width=True)
-
             if st.session_state.mds_coords is not None:
                 labels = _fid_array()
                 st.plotly_chart(
                     plot_mds(st.session_state.mds_coords, labels),
                     use_container_width=True, key="struct_plot_mds")
+
+            if st.session_state.king_matrix is not None:
+                st.info("Matrice KING calculee : " +
+                        str(st.session_state.king_matrix.shape))
+
+
+    with tabs[4]:
+        st.subheader("GWAS - Association genotype phenotype")
+        step_header("Extension", "GWAS avec LMM (EMMAX-like)",
+                    "Association SNP par SNP, controle par PCs et K.",
+                    "Identifier variants associes.",
+                    "Manhattan + QQ + lambdaGC + LocusZoom.")
+
+        if not has_qc():
+            st.warning("Lancez d'abord le QC.")
+        else:
+            gt_use = (st.session_state.gt_pruned if has_pruned()
+                      else st.session_state.gt_filt)
+            snp_use = (st.session_state.snp_pruned if has_pruned()
+                       else st.session_state.snp_filt)
+
+            st.markdown("### 1. Charger les phenotypes")
+            pheno_file = st.file_uploader(
+                "Fichier phenotypes (CSV / TSV / TXT / .gz)",
+                type=["csv", "tsv", "txt", "gz"], key="gwas_pheno_file")
+
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if pheno_file is not None:
+                    if st.button("Charger phenotypes",
+                                 key="gwas_btn_load_pheno",
+                                 use_container_width=True):
+                        try:
+                            raw = pheno_file.read()
+                            df_p = load_phenotypes_file(raw,
+                                                        pheno_file.name)
+                            merged, iid_col = match_phenotypes(
+                                st.session_state.ind_filt, df_p)
+                            st.session_state.pheno_matched = merged
+                            st.session_state["pheno_df"] = df_p
+                            st.success(str(len(df_p)) +
+                                       " lignes, ID : " + str(iid_col))
+                        except Exception as e:
+                            st.error("Erreur : " + str(e))
+
+            with col_b:
+                if st.button("Simuler un phenotype demo",
+                             key="gwas_btn_demo_pheno",
+                             use_container_width=True):
+                    ind = st.session_state.ind_filt
+                    n = len(ind)
+                    rng = np.random.default_rng(42)
+                    if (st.session_state.pca_scores is not None
+                            and len(st.session_state.pca_scores) == n):
+                        trait = (st.session_state.pca_scores[:, 0] * 2.0
+                                 + rng.normal(0, 0.5, n))
+                    else:
+                        trait = rng.normal(0, 1, n)
+                    merged = pd.DataFrame({
+                        "FID": ind["FID"].astype(str).values,
+                        "IID": ind["IID"].astype(str).values,
+                        "trait_simu": trait})
+                    st.session_state.pheno_matched = merged
+                    st.success("Phenotype cree.")
+
+            if st.session_state.pheno_matched is not None:
+                merged = st.session_state.pheno_matched
+                st.dataframe(merged.head(10),
+                             use_container_width=True)
+
+                num_cols = [c for c in merged.columns
+                            if c not in ("FID", "IID")
+                            and pd.api.types.is_numeric_dtype(merged[c])]
+                if num_cols:
+                    st.markdown("### 2. Parametres")
+                    c1, c2, c3 = st.columns(3)
+                    pheno_col = c1.selectbox("Phenotype", num_cols,
+                                             key="gwas_pheno_col")
+                    n_pcs = c2.slider("PCs covariables", 0, 10, 5,
+                                      key="gwas_n_pcs")
+                    maf_thr_gwas = c3.slider("MAF min", 0.0, 0.2, 0.05,
+                                             0.01, key="gwas_maf")
+                    use_lmm = st.checkbox(
+                        "LMM (recommande)", value=True,
+                        key="gwas_use_lmm")
+
+                    covs = np.empty((len(merged), 0))
+                    if (n_pcs > 0 and
+                            st.session_state.pca_scores is not None):
+                        pcs = st.session_state.pca_scores
+                        if pcs.shape[0] == len(merged):
+                            covs = pcs[:, :n_pcs]
+                        else:
+                            st.warning("Dimensions PCA diff individus.")
+
+                    st.markdown("### 3. Lancer")
+                    if st.button("Lancer GWAS", type="primary",
+                                 use_container_width=True,
+                                 key="gwas_btn_run"):
+                        try:
+                            pheno_vec = merged[pheno_col].to_numpy(
+                                dtype=float)
+                            K_use = (st.session_state.king_matrix
+                                     if st.session_state.king_matrix
+                                     is not None
+                                     else np.eye(len(merged)))
+                            with st.spinner("GWAS..."):
+                                res = run_gwas_lmm(
+                                    gt_use, pheno_vec, K_use, covs,
+                                    maf_min=float(maf_thr_gwas),
+                                    use_lmm=bool(use_lmm))
+                                res = annotate_gwas_results(res, snp_use)
+                                st.session_state.gwas_results = res
+                                st.session_state.gwas_pheno_name = pheno_col
+                                st.session_state.gwas_lambda = \
+                                    compute_lambda_gc(res["P"].values)
+                            st.success(str(len(res)) + " SNPs testes.")
+                        except Exception as e:
+                            st.error("Erreur : " + str(e))
+
+                    if st.session_state.gwas_results is not None:
+                        res = st.session_state.gwas_results
+                        if not res.empty:
+                            thr = gwas_thresholds(res["P"].values)
+                            lam = st.session_state.gwas_lambda
+
+                            c1, c2, c3, c4 = st.columns(4)
+                            c1.metric("SNPs testes", len(res))
+                            c2.metric("lambdaGC",
+                                      str(round(lam, 3))
+                                      if np.isfinite(lam) else "N/A")
+                            c3.metric("Bonferroni",
+                                      str(round(thr["bonferroni"], 10)))
+                            n_sig = int((res["P"] <=
+                                         thr["bonferroni"]).sum())
+                            c4.metric("Hits Bonferroni", n_sig)
+
+                            fig_m = plot_gwas_manhattan(
+                                res, bonferroni=thr["bonferroni"],
+                                fdr=thr.get("fdr_05"),
+                                title="Manhattan - " +
+                                      str(st.session_state.gwas_pheno_name))
+                            if fig_m is not None:
+                                st.plotly_chart(fig_m,
+                                                use_container_width=True,
+                                                key="gwas_plot_manhattan")
+
+                            fig_qq = plot_gwas_qq(res["P"].values, lam)
+                            if fig_qq is not None:
+                                st.plotly_chart(fig_qq,
+                                                use_container_width=True,
+                                                key="gwas_plot_qq")
+
+                            st.subheader("Top 20 SNPs")
+                            top = res.sort_values("P").head(20).copy()
+                            top["-log10P"] = -np.log10(
+                                np.clip(top["P"], 1e-300, 1))
+                            st.dataframe(top, use_container_width=True)
+
+                            if not top.empty:
+                                lead = st.selectbox(
+                                    "SNP pour LocusZoom",
+                                    top["SNP"].astype(str).tolist(),
+                                    key="gwas_lead_snp")
+                                row = top[
+                                    top["SNP"].astype(str) == lead].iloc[0]
+                                window_kb = st.slider(
+                                    "Fenetre (kb)", 50, 2000, 500, 50,
+                                    key="gwas_window_kb")
+                                fig_lz = plot_locuszoom(
+                                    res, snp_use, row["CHR"],
+                                    int(row["BP"]),
+                                    window_kb=window_kb)
+                                if fig_lz is not None:
+                                    st.plotly_chart(
+                                        fig_lz,
+                                        use_container_width=True,
+                                        key="gwas_plot_locuszoom")
+
+                            csv = res.to_csv(index=False).encode("utf-8")
+                            st.download_button(
+                                "Telecharger GWAS (CSV)",
+                                data=csv,
+                                file_name=("gwas_" +
+                                           str(st.session_state.gwas_pheno_name)
+                                           + ".csv"),
+                                mime="text/csv",
+                                key="gwas_dl_results",
+                                use_container_width=True)
 
 
 if __name__ == "__main__":
